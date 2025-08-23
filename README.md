@@ -4,6 +4,95 @@ An SDF Add-On for Blender.
 Rogue SDF AI is an Add-On initially made to improve SDF Prototyer Add-On but as I worked on it, I created its own SDF Renderer and features, but I have decided to keep both SDF Prototyper Features and add my own new features and new SDF Render Shaders on top of it.
 I don't know where to begin TBH I added a lot of features to this Add-On, in short this Add-On is in two sections: The 3D Geometry with SDF behaviour, drastically improved. The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep add and improve it.
 Please try it and let me know about the bugs and help me to improve it. 
+
+New Update:
+
+Improved and added lots of features, my next attempt will be making a better export with C++ and an SDF Render Engine with C++: 
+
+New Changes: Domain Scale, Shape Scale, duplicate and Repeat, Mirror, Radial Symmetry inherit their blending, color, smoothing.
+
+Intersection is not working that way, only with one object.
+
+Added Symmetrize One side to the other.
+
+Added Flip for select or all shapes.
+
+Fixed the Sphere nonuniformly scale problem.
+
+Fixed the Curve and Cone, the Curve now have better controls and profiles.
+
+Greatly improved the Curve Shape, pointy head and tails, scale and radius, smooth and hard shapes...
+
+Fixing Symmetrized, Repeat, duplicate for the Curve and bake symmetry for the Curve.
+
+Curve Duplicate is fixed.
+
+Fixed Repeat for Curve.
+
+Improved the SDF Shader View, it only shows withing the Domain Border and it increased the speed by 10X if zoomed out.
+
+Improved the Symmetrize Model, if you pass the center, it won't crash and it supports Curve and Cylinder Z symmetrize now works.
+
+Enabled Points as mesh view to increase the speed for the 3D Geometry section, don't know if it can speed that much but helps.
+
+Added Roundness for the Cube for SDF Shader View.
+
+Added Thickness for the Cube for SDF Shader View.
+
+Added Bevel for the Cube for SDF Shader View.
+
+Added Pyramid effect for the Cube for SDF Shader View.
+
+Added Twist effect for the Cube for SDF Shader View.
+
+Added Bend effect for the Cube for SDF Shader View.
+
+Added these features to Cylinder too.
+
+Added Capsule to the Sphere, Thickness, Pac Man.
+
+Added Cylinder Effect to the Prism, plus made it Ngon.
+
+Fixed the Symmetry and Flipped as much as I could.
+
+Added the Features to the Torus too, Thickness, Inner and Outer Radius, and Pac Man Cut 360.
+
+Added More shapes with their features to the Curve.
+
+Added Space and Local Orientation to the Curve.
+
+Added Elongation to the Torus and its Curve feature.
+
+Added Custom Points with all of the features, position, radius, local rotation and shape features for the Curve.
+
+Added Paint Blending mode as color for all of the shapes.
+
+Added a better Mesh Export PyMCubes that give us better results.
+
+Added Color Export as Vertex Color from SDF.
+
+Added new Blending modes with new Strength slider Displace, Indent, Relief, Engrave, Tunnel.
+
+Added the Mask Blending Mode.
+
+Added Chamfer Blending type.
+
+Added more selection methods for better exporting.
+
+Added third method of exporting VDB with Color.
+
+Improved the Light Preview.
+
+Added Support for Max and Linux too.
+
+Added Exporting UVs with Texture Map from Vertex Color.
+
+Added Support for Splats with particles that works as path in hair system too or custom shape.
+
+Added support for baking from a Remeshed object.
+
+Added Radial for Repeat.
+
 Let me explains some of its new features, improvements:
 The 3D Geometry Section:
 1-Scale: I added unform Scale to control the scale of all of the shapes inside the Domain.
