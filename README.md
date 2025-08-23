@@ -86,7 +86,7 @@ Added third method of exporting VDB with Color.
 
 Improved the Light Preview.
 
-Added Support for Max and Linux too.
+Added Support for Mac and Linux too.
 
 Added Exporting UVs with Texture Map from Vertex Color.
 
