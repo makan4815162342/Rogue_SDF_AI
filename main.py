@@ -35,6 +35,18 @@ from gpu_extras.batch import batch_for_shader
 # ——— Blender math utils ———
 from mathutils import Vector
 
+try:
+    import mcubes
+    HAS_MCUBES = True
+except ImportError:
+    HAS_MCUBES = False
+
+try:
+    import openvdb
+    HAS_OPENVDB = True
+except ImportError:
+    HAS_OPENVDB = False
+
 
 # keep these globals at the top
 handler = shader = batch = None
@@ -85,113 +97,244 @@ def _redraw_shader_view(self, context):
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
 
+def update_visibility_and_mute(self, context):
+    """
+    Directly updates the visibility and mute state of an SDF object and its node.
+    This is more reliable than using a global handler.
+    """
+    if self.empty_object:
+        # Update viewport visibility of the empty
+        self.empty_object.hide_viewport = self.is_viewport_hidden
+        
+        # Find the associated geometry node and update its mute state
+        node_tree = get_sdf_geometry_node_tree(context)
+        if node_tree:
+            node = next((n for n in node_tree.nodes if n.get("associated_empty") == self.empty_object.name), None)
+            if node and node.mute != self.is_hidden:
+                node.mute = self.is_hidden
+    
+    # Always rewire the chain after a mute, as it affects the connections
+    rewire_full_sdf_chain(context)
 
-# Find this function in main.py and add the new 'if item.icon == 'MESH_CONE':' block.
+def update_point_cloud_preview(self, context):
+    """
+    Dedicated update function for the point cloud toggle.
+    This safely calls the necessary updates without causing a feedback loop.
+    """
+    # Only execute if the change is made by a user action, not during file load or creation
+    if context.object and context.object.mode == 'OBJECT':
+        rewire_full_sdf_chain(context)
+        _redraw_shader_view(self, context)
+
+#----------------------------------------------------------------------------------------------------
+
+
+from mathutils import Euler, Vector, Matrix # Make sure Matrix is also imported
 
 def collect_sdf_data(context):
     """
-    Gather ALL shape data for the SDF shader.
-    This version is simplified to pass a new 'itemID' to the shader,
-    which will handle all the complex grouping logic.
+    Gather ALL shape data. This version filters shapes based on the current
+    view mode (All, Selected, Unselected) for both preview and baking.
     """
     shapes = []
-    op_map = { 'SMOOTH_UNION': 3, 'SMOOTH_SUBTRACT': 4, 'SMOOTH_INTERSECT': 5, }
+    op_map = {
+        'UNION': 3, 'SUBTRACT': 4, 'INTERSECT': 5, 'PAINT': 6,
+        'DISPLACE': 7, 'INDENT': 8, 'RELIEF': 9, 'ENGRAVE': 10, 'MASK': 11
+    }
     domain = getattr(context.scene, "sdf_domain", None)
     
     MAX_SHAPES_CURRENT = context.scene.sdf_max_shapes
 
     if not domain:
-        # The data tuple now has 11 elements: (..., color, highlight, itemID)
-        return [(-1, (0,0,0), (1,1,1), (1,0,0,0), 0, 0.0, 0, 0, (1,1,1), 0, -1)] * MAX_SHAPES_CURRENT
+        return [(-1, (0,0,0), (1,1,1), (1,0,0,0), 0, 0.0, 0, 0, (1,1,1), 0, -1, (0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0), 0.0, 0.0)] * MAX_SHAPES_CURRENT
 
-    # We use enumerate to get a unique ID for each item in the UI list.
+    # --- NEW: Get view mode and selected objects ---
+    view_mode = context.scene.sdf_view_mode
+    selected_empties = {obj for obj in context.view_layer.objects.selected}
+    # --- END NEW ---
+
     for item_index, item in enumerate(domain.sdf_nodes):
         e = item.empty_object
-        if not e or item.is_hidden or len(shapes) >= MAX_SHAPES_CURRENT:
+        if not e or item.is_hidden:
             continue
 
-        code = { 
-            'MESH_CUBE': 0, 'MESH_UVSPHERE': 1, 'MESH_TORUS': 2, 
-            'MESH_CYLINDER': 3, 'MESH_CONE': 4, 'MESH_ICOSPHERE': 5,
-            'CURVE_BEZCURVE': 6,
-        }.get(item.icon, -1)
+        # --- NEW: Filtering Logic ---
+        is_selected = e in selected_empties
+        if view_mode == 'SELECTED' and not is_selected:
+            continue # Skip if we only want selected, and this one isn't
+        if view_mode == 'UNSELECTED' and is_selected:
+            continue # Skip if we only want unselected, and this one is
+        # --- END NEW ---
+
+        if len(shapes) >= MAX_SHAPES_CURRENT:
+            continue
+
+        op_base = op_map.get(item.operation, 3)
+        op = op_base
+        if item.operation in ['UNION', 'SUBTRACT', 'INTERSECT'] and item.blend_type == 'CHAMFER':
+            op = op_base + 10
         
-        op = op_map.get(item.operation, 3)
+        # ... (the rest of the function from this point on is identical to your current version)
+        code = { 'MESH_CUBE': 0, 'MESH_UVSPHERE': 1, 'MESH_TORUS': 2, 'MESH_CYLINDER': 3, 'MESH_CONE': 4, 'MESH_ICOSPHERE': 5, 'CAPSULE': 6 }.get(item.icon, -1)
         blend = item.blend
+        strength = item.blend_strength
+        fill = item.mask_fill_amount
         color = item.preview_color
         highlight = int(item.use_highlight)
         mirror_flags = (int(item.use_mirror_x) * 1) | (int(item.use_mirror_y) * 2) | (int(item.use_mirror_z) * 4)
         radial_count = item.radial_mirror_count if item.use_radial_mirror else 0
-        itemID = item_index # The unique ID for this group of shapes.
-
+        itemID = item_index
+        params1, params2 = (0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0)
+        if item.icon != 'CURVE_BEZCURVE':
+            params1, params2 = get_params_for_shape(item, item.icon)
         if item.icon == 'CURVE_BEZCURVE':
             curve_obj = next((child for child in e.children if child.type == 'CURVE'), None)
             if not curve_obj or not curve_obj.data.splines: continue
-            
-            curve_segments = []
+            def lerp_val(v1, v2, f): return v1 * (1.0 - f) + v2 * f
+            def lerp_vec(v1, v2, f): return v1.lerp(v2, f)
+            sorted_points = []
+            if item.curve_control_mode == 'CUSTOM' and item.custom_control_points:
+                sorted_points = sorted(item.custom_control_points, key=lambda p: p.t_value)
             for spline in curve_obj.data.splines:
                 if len(spline.bezier_points) < 2: continue
-                
-                if item.curve_mode == 'HARD':
-                    for i in range(len(spline.bezier_points) - 1):
-                        p1_local, p2_local = spline.bezier_points[i].co, spline.bezier_points[i+1].co
-                        radius = spline.bezier_points[i].radius * e.empty_display_size
-                        start, end = curve_obj.matrix_world @ p1_local, curve_obj.matrix_world @ p2_local
-                        curve_segments.append({'start': start, 'end': end, 'radius': radius})
-                else: # 'SMOOTH'
-                    for i in range(len(spline.bezier_points) - 1):
-                        bp1, bp2 = spline.bezier_points[i], spline.bezier_points[i+1]
-                        p0, h0, h1, p1 = bp1.co, bp1.handle_right, bp2.handle_left, bp2.co
-                        r1, r2 = bp1.radius * e.empty_display_size, bp2.radius * e.empty_display_size
-                        subdivisions = item.curve_subdivisions
-                        last_point = curve_obj.matrix_world @ get_bezier_point(0.0, p0, h0, h1, p1)
-                        for j in range(1, subdivisions + 1):
-                            t = j / float(subdivisions)
-                            current_point = curve_obj.matrix_world @ get_bezier_point(t, p0, h0, h1, p1)
-                            current_radius = r1 * (1.0 - t) + r2 * t
-                            curve_segments.append({'start': last_point, 'end': current_point, 'radius': current_radius})
-                            last_point = current_point
-            
-            if not curve_segments: continue
-
-            for seg in curve_segments:
+                total_spline_length = 0
+                segment_lengths = []
+                for i in range(len(spline.bezier_points) - 1):
+                    length = (spline.bezier_points[i+1].co - spline.bezier_points[i].co).length
+                    segment_lengths.append(length)
+                    total_spline_length += length
+                if total_spline_length < 0.0001: continue
+                distance_along_spline = 0
+                for i in range(len(spline.bezier_points) - 1):
+                    bp1, bp2 = spline.bezier_points[i], spline.bezier_points[i+1]
+                    r1, r2 = bp1.radius * item.curve_global_radius, bp2.radius * item.curve_global_radius
+                    segment_start_t = distance_along_spline / total_spline_length
+                    distance_along_spline += segment_lengths[i]
+                    segment_end_t = distance_along_spline / total_spline_length
+                    p0_geom, h0_geom, h1_geom, p1_geom = bp1.co, bp1.handle_right, bp2.handle_left, bp2.co
+                    density = item.curve_point_density
+                    num_points = max(1, int(density / (item.curve_instance_spacing + 1e-6)))
+                    for j in range(num_points):
+                        if len(shapes) >= MAX_SHAPES_CURRENT: break
+                        t_sub = j / float(num_points - 1) if num_points > 1 else 0.0
+                        current_point_local = get_bezier_point(t_sub, p0_geom, h0_geom, h1_geom, p1_geom) if item.curve_mode == 'SMOOTH' else p0_geom.lerp(p1_geom, t_sub)
+                        current_point = curve_obj.matrix_world @ current_point_local
+                        direction = Vector((0,1,0))
+                        if item.curve_mode == 'SMOOTH' and j == num_points - 1 and num_points > 1:
+                            prev_t = (j - 1) / float(num_points - 1)
+                            prev_point_local = get_bezier_point(prev_t, p0_geom, h0_geom, h1_geom, p1_geom)
+                            prev_point = curve_obj.matrix_world @ prev_point_local
+                            direction = (current_point - prev_point)
+                        else:
+                            next_t_sub = (j + 0.1) / float(num_points) if item.curve_mode == 'HARD' else min(t_sub + 0.01, 1.0)
+                            next_point_local = p0_geom.lerp(p1_geom, next_t_sub) if item.curve_mode == 'HARD' else get_bezier_point(next_t_sub, p0_geom, h0_geom, h1_geom, p1_geom)
+                            next_point = curve_obj.matrix_world @ next_point_local
+                            direction = (next_point - current_point)
+                        if direction.length > 0.0001:
+                            direction.normalize()
+                        t_spline = segment_start_t * (1.0 - t_sub) + segment_end_t * t_sub
+                        final_params1, final_params2 = Vector((0.0,0.0,0.0,0.0)), Vector((0.0,0.0,0.0,0.0))
+                        final_color = Vector(item.preview_color)
+                        final_radius_mult = 1.0
+                        final_shape_code = { 'MESH_CUBE': 0, 'MESH_UVSPHERE': 1, 'MESH_TORUS': 2, 'MESH_CYLINDER': 3, 'MESH_CONE': 4, 'MESH_ICOSPHERE': 5, 'CAPSULE': 6 }.get(item.curve_instance_type, 1)
+                        final_local_rot = Euler(item.curve_instance_rotation, 'XYZ').to_quaternion()
+                        if item.curve_control_mode == 'CUSTOM' and sorted_points:
+                            p1, p2 = sorted_points[0], sorted_points[-1]
+                            if t_spline <= p1.t_value: p2 = p1
+                            elif t_spline >= p2.t_value: p1 = p2
+                            else:
+                                for k in range(len(sorted_points) - 1):
+                                    if sorted_points[k].t_value <= t_spline < sorted_points[k+1].t_value:
+                                        p1, p2 = sorted_points[k], sorted_points[k+1]
+                                        break
+                            f = 0.0
+                            if (p2.t_value - p1.t_value) > 1e-6: f = (t_spline - p1.t_value) / (p2.t_value - p1.t_value)
+                            final_color = lerp_vec(Vector(p1.color), Vector(p2.color), f)
+                            final_radius_mult = lerp_val(p1.radius_multiplier, p2.radius_multiplier, f)
+                            final_shape_code = { 'MESH_UVSPHERE': 1, 'MESH_CUBE': 0, 'MESH_ICOSPHERE': 5, 'CAPSULE': 6, 'MESH_TORUS': 2, 'MESH_CYLINDER': 3, 'MESH_CONE': 4 }.get(p1.shape_type, 1)
+                            q1, q2 = Euler(p1.rotation, 'XYZ').to_quaternion(), Euler(p2.rotation, 'XYZ').to_quaternion()
+                            final_local_rot = q1.slerp(q2, f)
+                            if final_shape_code == 0:
+                                thickness = lerp_val(p1.thickness, p2.thickness, f); roundness = lerp_val(p1.roundness, p2.roundness, f); bevel = lerp_val(p1.bevel, p2.bevel, f); pyramid = lerp_val(p1.pyramid, p2.pyramid, f); twist = lerp_val(p1.twist, p2.twist, f); bend = lerp_val(p1.bend, p2.bend, f)
+                                final_params1 = Vector((thickness, roundness, bevel, pyramid)); final_params2 = Vector((twist, bend, 0.0, 0.0))
+                            elif final_shape_code == 1:
+                                sphere_thickness = lerp_val(p1.sphere_thickness, p2.sphere_thickness, f); sphere_elongation = lerp_val(p1.sphere_elongation, p2.sphere_elongation, f); sphere_cut_angle = lerp_val(p1.sphere_cut_angle, p2.sphere_cut_angle, f)
+                                final_params1 = Vector((sphere_thickness, sphere_elongation, sphere_cut_angle, 0.0))
+                            elif final_shape_code == 3:
+                                cylinder_thickness = lerp_val(p1.cylinder_thickness, p2.cylinder_thickness, f); cylinder_roundness = lerp_val(p1.cylinder_roundness, p2.cylinder_roundness, f); cylinder_pyramid = lerp_val(p1.cylinder_pyramid, p2.cylinder_pyramid, f); cylinder_bend = lerp_val(p1.cylinder_bend, p2.cylinder_bend, f)
+                                final_params1 = Vector((cylinder_thickness, cylinder_roundness, cylinder_pyramid, 0.0)); final_params2 = Vector((0.0, cylinder_bend, 0.0, 0.0))
+                            elif final_shape_code == 5:
+                                prism_sides = lerp_val(p1.prism_sides, p2.prism_sides, f); prism_pyramid = lerp_val(p1.prism_pyramid, p2.prism_pyramid, f); prism_thickness = lerp_val(p1.prism_thickness, p2.prism_thickness, f); prism_bend = lerp_val(p1.prism_bend, p2.prism_bend, f); prism_twist = lerp_val(p1.prism_twist, p2.prism_twist, f)
+                                final_params1 = Vector((prism_sides, prism_pyramid, prism_thickness, 0.0)); final_params2 = Vector((prism_bend, prism_twist, 0.0, 0.0))
+                            elif final_shape_code == 2:
+                                torus_outer_radius = lerp_val(p1.torus_outer_radius, p2.torus_outer_radius, f); torus_inner_radius = lerp_val(p1.torus_inner_radius, p2.torus_inner_radius, f); torus_cut_angle = lerp_val(p1.torus_cut_angle, p2.torus_cut_angle, f); torus_thickness = lerp_val(p1.torus_thickness, p2.torus_thickness, f); torus_elongation = lerp_val(p1.torus_elongation, p2.torus_elongation, f)
+                                final_params1 = Vector((torus_outer_radius, torus_inner_radius, torus_cut_angle, torus_thickness)); final_params2 = Vector((torus_elongation, 0.0, 0.0, 0.0))
+                        else:
+                            final_params1, final_params2 = get_params_for_shape(item, item.curve_instance_type)
+                        taper_factor = item.curve_taper_head * (1.0 - t_spline) + item.curve_taper_tail * t_spline
+                        current_radius = (r1 * (1.0 - t_sub) + r2 * t_sub) * item.curve_global_radius * taper_factor * final_radius_mult
+                        base_rotation_quat = Vector((0,1,0)).rotation_difference(direction)
+                        final_rotation = base_rotation_quat @ final_local_rot
+                        pos, rot = current_point, final_rotation
+                        height = (segment_lengths[i] / num_points) * item.curve_segment_scale
+                        if final_shape_code == 6: scl = Vector((current_radius, height, current_radius))
+                        elif final_shape_code == 4: scl = Vector((current_radius, height, 0.001))
+                        elif final_shape_code == 3: scl = Vector((current_radius, height, current_radius))
+                        else: scl = Vector((current_radius, current_radius, current_radius))
+                        shapes.append((final_shape_code, pos, scl, rot, op, blend, mirror_flags, radial_count, final_color, highlight, itemID, final_params1, final_params2, strength, fill))
                 if len(shapes) >= MAX_SHAPES_CURRENT: break
-                pos = (seg['start'] + seg['end']) / 2.0
-                height = (seg['end'] - seg['start']).length
-                scl = Vector((seg['radius'], height, seg['radius']))
-                direction = (seg['end'] - seg['start']).normalized() if height > 0 else Vector((0,1,0))
-                rot = direction.to_track_quat('Y', 'Z')
-                # Every segment gets the same op, blend, and itemID. The shader will sort it out.
-                shapes.append((code, pos, scl, rot, op, blend, mirror_flags, radial_count, color, highlight, itemID))
-
-        else: # STANDARD PRIMITIVE LOGIC
+        else:
+            mw = e.matrix_world
             if item.icon == 'MESH_CONE':
                 tip_empty = next((child for child in e.children if "Tip" in child.name), None)
                 if not tip_empty: continue
                 base_pos, tip_pos = e.matrix_world.to_translation(), tip_empty.matrix_world.to_translation()
                 pos, height = (base_pos + tip_pos) / 2.0, (tip_pos - base_pos).length
-                r1 = (e.matrix_world.to_scale().x + e.matrix_world.to_scale().z) / 2.0
-                r2 = (tip_empty.matrix_world.to_scale().x + tip_empty.matrix_world.to_scale().z) / 2.0
+                _, _, base_scl = e.matrix_world.decompose()
+                _, _, tip_scl = tip_empty.matrix_world.decompose()
+                r1 = (abs(base_scl.x) + abs(base_scl.z)) / 2.0
+                r2 = (abs(tip_scl.x) + abs(tip_scl.z)) / 2.0
                 scl, direction = Vector((r1, height, r2)), (tip_pos - base_pos).normalized() if height > 0 else Vector((0,1,0))
                 rot = direction.to_track_quat('Y', 'Z')
             else:
-                mw = e.matrix_world
-                pos, scl, rot = mw.to_translation(), mw.to_scale(), mw.to_quaternion()
+                pos, rot, scl = mw.decompose() 
             
-            shapes.append((code, pos, scl, rot, op, blend, mirror_flags, radial_count, color, highlight, itemID))
+            shapes.append((code, pos, scl, rot, op, blend, mirror_flags, radial_count, color, highlight, itemID, params1, params2, strength, fill))
 
     while len(shapes) < MAX_SHAPES_CURRENT:
-        shapes.append((-1, (0,0,0), (1,1,1), (1,0,0,0), 0, 0.0, 0, 0, (1,1,1), 0, -1))
+        shapes.append((-1, (0,0,0), (1,1,1), (1,0,0,0), 0, 0.0, 0, 0, (1,1,1), 0, -1, (0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0), 0.0, 0.0))
         
     return shapes
 
 
+def get_params_for_shape(item, shape_type):
+    """Helper function to pack parameters for a given shape type from an item."""
+    if shape_type == 'MESH_CUBE':
+        return Vector((item.thickness, item.roundness, item.bevel, item.pyramid)), Vector((item.twist, item.bend, 0.0, 0.0))
+    elif shape_type == 'MESH_UVSPHERE':
+        return Vector((item.sphere_thickness, item.sphere_elongation, item.sphere_cut_angle, 0.0)), Vector((0.0, 0.0, 0.0, 0.0))
+    elif shape_type == 'MESH_CYLINDER':
+        return Vector((item.cylinder_thickness, item.cylinder_roundness, item.cylinder_pyramid, 0.0)), Vector((0.0, item.cylinder_bend, 0.0, 0.0))
+    elif shape_type == 'MESH_ICOSPHERE':
+        return Vector((item.prism_sides, item.prism_pyramid, item.prism_thickness, 0.0)), Vector((item.prism_bend, item.prism_twist, 0.0, 0.0))
+    elif shape_type == 'MESH_TORUS':
+        return Vector((item.torus_outer_radius, item.torus_inner_radius, item.torus_cut_angle, item.torus_thickness)), Vector((item.torus_elongation, 0.0, 0.0, 0.0))
+    return Vector((0.0, 0.0, 0.0, 0.0)), Vector((0.0, 0.0, 0.0, 0.0))
+#----------------------------------------------------------------------------------------------------
+
+import bpy
+import gpu
+from gpu import state
+from gpu.types import GPUShader
+from gpu_extras.batch import batch_for_shader
+from bpy_extras.view3d_utils import location_3d_to_region_2d  # <-- THE CORRECT, RENAMED FUNCTION
+from mathutils import Vector
 import array
+import math
 
 def draw_sdf_shader():
     """
-    Main draw handler for the SDF Shader Preview.
-    This version packs and sends the new itemID for shader-side grouping.
+    Main draw handler for the SDF Shader Preview. This version sends packed data.
     """
     global shader, batch
     if not shader: return
@@ -200,80 +343,127 @@ def draw_sdf_shader():
     scene = ctx.scene
     region = ctx.region
     rv3d = ctx.region_data
-    MAX_SHAPES_CURRENT = scene.sdf_max_shapes
+    domain = getattr(scene, "sdf_domain", None)
+    
+    if not domain: return
 
-    state.depth_test_set('NONE')
-    state.blend_set('NONE')
+    corners = [domain.matrix_world @ Vector(corner) for corner in domain.bound_box]
+    coords_2d = [location_3d_to_region_2d(region, rv3d, c) for c in corners]
+    visible_coords = [c for c in coords_2d if c is not None]
+    if not visible_coords: return
+    min_x = min(c.x for c in visible_coords); max_x = max(c.x for c in visible_coords)
+    min_y = min(c.y for c in visible_coords); max_y = max(c.y for c in visible_coords)
+    scissor_x = int(min_x); scissor_y = int(min_y)
+    scissor_w = int(max_x - min_x); scissor_h = int(max_y - min_y)
+    state.scissor_test_set(True)
+    scissor_x = max(0, scissor_x); scissor_y = max(0, scissor_y)
+    scissor_w = min(region.width - scissor_x, scissor_w)
+    scissor_h = min(region.height - scissor_y, scissor_h)
+    if scissor_w <= 0 or scissor_h <= 0:
+        state.scissor_test_set(False)
+        return
+    state.scissor_set(scissor_x, scissor_y, scissor_w, scissor_h)
+    state.depth_test_set('NONE'); state.blend_set('NONE')
 
     shader.bind()
     shader.uniform_float("viewportSize", (region.width, region.height))
     shader.uniform_float("viewMatrixInv", rv3d.view_matrix.inverted())
     shader.uniform_float("projMatrixInv", rv3d.window_matrix.inverted())
 
-    az, el = scene.sdf_light_azimuth, scene.sdf_light_elevation
-    shader.uniform_float("uLightDir", (math.cos(el) * math.cos(az), math.sin(el), math.cos(el) * math.sin(az)))
+    # --- UPDATED: Send all new lighting uniforms ---
+    shader.uniform_float("uLightDir", scene.sdf_light_direction)
+    shader.uniform_float("uBrightness", scene.sdf_preview_brightness)
+    shader.uniform_float("uContrast", scene.sdf_preview_contrast)
+    shader.uniform_int("uCavityEnable", int(scene.sdf_cavity_enable))
+    shader.uniform_float("uCavityStrength", scene.sdf_cavity_strength)
+    # --- END OF UPDATE ---
+
     shader.uniform_float("uGlobalTint", scene.sdf_global_tint)
-    shader.uniform_float("uDomainCenter", scene.sdf_domain.location if scene.sdf_domain else (0.0, 0.0, 0.0))
+    shader.uniform_float("uDomainCenter", domain.location)
 
     shapes = collect_sdf_data(ctx)
+    MAX_SHAPES_CURRENT = scene.sdf_max_shapes
     shader.uniform_int("uCount", sum(1 for s in shapes if s[0] >= 0))
 
-    # --- Flatten ALL data directly from the 'shapes' list ---
-    tf                  = [int(s[0]) for s in shapes]
-    type_flat           = [tf[i+j] for i in range(0, MAX_SHAPES_CURRENT, 4) for j in range(4)]
-    pos_flat            = [v for s in shapes for v in s[1]]
-    scale_flat          = [v for s in shapes for v in s[2]]
-    rot_flat            = [v for s in shapes for v in s[3]]
-    op_flat             = [int(s[4]) for s in shapes]
-    blend_flat          = [float(s[5]) for s in shapes]
-    mirror_flags_flat   = [int(s[6]) for s in shapes]
-    radial_count_flat   = [int(s[7]) for s in shapes]
-    color_flat          = [v for s in shapes for v in s[8]]
-    highlight_flat      = [int(s[9]) for s in shapes]
-    # --- NEW: Pack the itemID ---
-    item_id_flat        = [int(s[10]) for s in shapes]
+    # --- Data Flattening ---
+    tf = [int(s[0]) for s in shapes]
+    while len(tf) % 4 != 0: tf.append(-1)
+    type_flat = [tf[i+j] for i in range(0, len(tf), 4) for j in range(4)]
+    pos_flat = [v for s in shapes for v in s[1]]
+    scale_flat = [v for s in shapes for v in s[2]]
+    rot_flat = [v for s in shapes for v in s[3]]
+    op_flat = [int(s[4]) for s in shapes]
+    blend_flat = [float(s[5]) for s in shapes]
+    strength_flat = [float(s[13]) for s in shapes]
+    fill_flat = [float(s[14]) for s in shapes]
+    mirror_flags_flat = [int(s[6]) for s in shapes]
+    radial_count_flat = [int(s[7]) for s in shapes]
+    color_flat = [v for s in shapes for v in s[8]]
+    item_id_flat = [int(s[10]) for s in shapes]
+    params1_flat = [v for s in shapes for v in s[11]]
+    params2_flat = [v for s in shapes for v in s[12]]
 
-    # --- Create byte buffers ---
-    type_buf           = array.array('i', type_flat).tobytes()
-    pos_buf            = array.array('f', pos_flat).tobytes()
-    scale_buf          = array.array('f', scale_flat).tobytes()
-    rot_buf            = array.array('f', rot_flat).tobytes()
-    op_buf             = array.array('i', op_flat).tobytes()
-    blend_buf          = array.array('f', blend_flat).tobytes()
-    mirror_flags_buf   = array.array('i', mirror_flags_flat).tobytes()
-    radial_count_buf   = array.array('i', radial_count_flat).tobytes()
-    color_buf          = array.array('f', color_flat).tobytes()
-    highlight_buf      = array.array('i', highlight_flat).tobytes()
-    item_id_buf        = array.array('i', item_id_flat).tobytes() # --- NEW ---
+    max_items = 64
+    highlight_per_item = [0] * max_items
+    if domain and hasattr(domain, 'sdf_nodes'):
+        for i, item in enumerate(domain.sdf_nodes):
+            if i < max_items:
+                highlight_per_item[i] = int(item.use_highlight)
+    highlight_flat = highlight_per_item
 
-    # --- Get shader uniform locations ---
-    loc_t, loc_p, loc_s, loc_r = shader.uniform_from_name("uShapeTypePacked"), shader.uniform_from_name("uShapePos"), shader.uniform_from_name("uShapeScale"), shader.uniform_from_name("uShapeRot")
-    loc_o, loc_b, loc_c = shader.uniform_from_name("uShapeOp"), shader.uniform_from_name("uShapeBlend"), shader.uniform_from_name("uShapeColor")
-    loc_mf, loc_rc, loc_hl = shader.uniform_from_name("uShapeMirrorFlags"), shader.uniform_from_name("uShapeRadialCount"), shader.uniform_from_name("uShapeHighlight")
-    loc_iid = shader.uniform_from_name("uShapeItemID") # --- NEW ---
+    # --- Byte Buffer Creation ---
+    type_buf = array.array('i', type_flat).tobytes()
+    pos_buf = array.array('f', pos_flat).tobytes()
+    scale_buf = array.array('f', scale_flat).tobytes()
+    rot_buf = array.array('f', rot_flat).tobytes()
+    op_buf = array.array('i', op_flat).tobytes()
+    blend_buf = array.array('f', blend_flat).tobytes()
+    strength_buf = array.array('f', strength_flat).tobytes()
+    fill_buf = array.array('f', fill_flat).tobytes()
+    mirror_flags_buf = array.array('i', mirror_flags_flat).tobytes()
+    radial_count_buf = array.array('i', radial_count_flat).tobytes()
+    color_buf = array.array('f', color_flat).tobytes()
+    highlight_buf = array.array('i', highlight_flat).tobytes()
+    item_id_buf = array.array('i', item_id_flat).tobytes()
+    params1_buf = array.array('f', params1_flat).tobytes()
+    params2_buf = array.array('f', params2_flat).tobytes()
 
-    # --- Upload data to the GPU ---
-    shader.uniform_vector_int(loc_t, type_buf,  4,  MAX_SHAPES_CURRENT // 4)
-    shader.uniform_vector_float(loc_p, pos_buf,   3, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_float(loc_s, scale_buf, 3, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_float(loc_r, rot_buf,   4, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_int(loc_o, op_buf,    1, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_float(loc_b, blend_buf, 1, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_float(loc_c, color_buf, 3, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_int(loc_mf, mirror_flags_buf, 1, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_int(loc_rc, radial_count_buf, 1, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_int(loc_hl, highlight_buf, 1, MAX_SHAPES_CURRENT)
-    shader.uniform_vector_int(loc_iid, item_id_buf, 1, MAX_SHAPES_CURRENT) # --- NEW ---
+    def safe_uniform_vector(uniform_name, buffer, components, count):
+        try:
+            loc = shader.uniform_from_name(uniform_name)
+            shader.uniform_vector_float(loc, buffer, components, count)
+        except ValueError: pass
+            
+    def safe_uniform_vector_int(uniform_name, buffer, components, count):
+        try:
+            loc = shader.uniform_from_name(uniform_name)
+            shader.uniform_vector_int(loc, buffer, components, count)
+        except ValueError: pass
 
+    # --- Uploading All Uniforms to the GPU ---
+    safe_uniform_vector_int("uShapeTypePacked", type_buf, 4, len(type_flat) // 4)
+    safe_uniform_vector("uShapePos", pos_buf, 3, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeScale", scale_buf, 3, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeRot", rot_buf, 4, MAX_SHAPES_CURRENT)
+    safe_uniform_vector_int("uShapeOp", op_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeBlend", blend_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeBlendStrength", strength_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeMaskFill", fill_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeColor", color_buf, 3, MAX_SHAPES_CURRENT)
+    safe_uniform_vector_int("uShapeMirrorFlags", mirror_flags_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector_int("uShapeRadialCount", radial_count_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector_int("uShapeHighlight", highlight_buf, 1, max_items)
+    safe_uniform_vector_int("uShapeItemID", item_id_buf, 1, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeParams1", params1_buf, 4, MAX_SHAPES_CURRENT)
+    safe_uniform_vector("uShapeParams2", params2_buf, 4, MAX_SHAPES_CURRENT)
+    
     shader.uniform_int("uColorBlendMode", 1 if scene.sdf_color_blend_mode == 'SOFT' else 0)
 
     batch.draw(shader)
+    
+    state.scissor_test_set(False)
     state.depth_test_set('LESS_EQUAL')
     state.blend_set('NONE')
-
-
-
-
 
 
 import os, textwrap, math
@@ -287,70 +477,217 @@ from gpu import state
 handler = shader = batch = None
 
 def enable_sdf_shader_view(enable):
-    import os, textwrap
-    from gpu.types       import GPUShader
-    from gpu_extras.batch import batch_for_shader
-
     global handler, shader, batch
-
-    ctx    = bpy.context
-    scene  = ctx.scene
+    ctx = bpy.context
+    scene = ctx.scene
     domain = getattr(scene, "sdf_domain", None)
+    if not domain: return
 
-    # 1) Mute or unmute the final GN node (prevents mesh drawing)
-    toggle_gn_output_mute(ctx, mute=enable)
+    # Find the Geometry Nodes modifier
+    geo_mod = next((m for m in domain.modifiers if m.type == 'NODES'), None)
 
-    # 2) Swap the domain’s display type to BOUNDS for quick wire‐box
-    if domain:
-        if enable:
-            domain["_orig_display"] = domain.display_type
-            domain.display_type     = 'BOUNDS'
-        else:
-            if "_orig_display" in domain:
-                domain.display_type = domain["_orig_display"]
-                del domain["_orig_display"]
-
-    # 3) When enabling, compile & install the GLSL handler
     if enable and handler is None:
-        # 3a) Build the full-screen shader
+        # --- ENTERING MODELING MODE ---
+        if geo_mod:
+            # Mute the modifier to disable CPU mesh generation
+            geo_mod.show_viewport = False
+            print("[Rogue SDF AI] Geometry Nodes muted for performance.")
+
+        # Set the domain to show bounds so it doesn't obscure the shader
+        domain["_orig_display"] = domain.display_type
+        domain.display_type = 'BOUNDS'
+
+        # (The rest of the shader setup is the same)
         vert_src = textwrap.dedent("""\
-            in vec2 pos;
-            out vec2 uv;
-            void main() {
-                uv = pos * 0.5 + 0.5;
-                gl_Position = vec4(pos, 0.0, 1.0);
-            }
+            in vec2 pos; out vec2 uv; void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }
         """)
         frag_path = os.path.join(os.path.dirname(__file__), "sdf_raycast.frag")
-        with open(frag_path, 'r', encoding='utf-8-sig') as f:
-            frag_src = f.read()
-
+        with open(frag_path, 'r', encoding='utf-8-sig') as f: frag_src = f.read()
         shader = GPUShader(vert_src, frag_src)
-        batch  = batch_for_shader(
-            shader, 'TRI_STRIP',
-            {"pos":[(-1,-1),(1,-1),(-1,1),(1,1)]}
-        )
-
-        # 3b) Install the draw handler
-        handler = bpy.types.SpaceView3D.draw_handler_add(
-            draw_sdf_shader, (), 'WINDOW', 'POST_VIEW'
-        )
-        if ctx.area:
-            ctx.area.tag_redraw()
+        batch = batch_for_shader(shader, 'TRI_STRIP', {"pos":[(-1,-1),(1,-1),(-1,1),(1,1)]})
+        handler = bpy.types.SpaceView3D.draw_handler_add(draw_sdf_shader, (), 'WINDOW', 'POST_VIEW')
+        
+        if ctx.area: ctx.area.tag_redraw()
         print("SDF Shader View ENABLED.")
 
-    # 4) When disabling, remove the handler and restore state
     elif not enable and handler:
+        # --- EXITING MODELING MODE ---
         bpy.types.SpaceView3D.draw_handler_remove(handler, 'WINDOW')
         handler = shader = batch = None
 
-        # force a redraw so the GN mesh + empties reappear
-        if ctx.area:
-            ctx.area.tag_redraw()
+        if geo_mod:
+            # Un-mute the modifier to show the final mesh
+            geo_mod.show_viewport = True
+            print("[Rogue SDF AI] Geometry Nodes unmuted.")
+        
+        if "_orig_display" in domain:
+            domain.display_type = domain["_orig_display"]
+            del domain["_orig_display"]
+
+        if ctx.area: ctx.area.tag_redraw()
         print("SDF Shader View DISABLED.")
+#----------------------------------------------------------------------------------------------------
+
+def _clone_sdf_hierarchy(context, source_item, source_node, new_name_suffix=""):
+    """
+    A robust function to duplicate an SDF shape's entire hierarchy.
+    It clones the main empty, all its children, the UI list item, and the geometry node.
+    Returns a dictionary containing the new item, empty, and node.
+    """
+    domain_obj = context.scene.sdf_domain
+    node_tree = get_sdf_geometry_node_tree(context)
+    source_empty = source_item.empty_object
+
+    new_node = node_tree.nodes.new(type=source_node.bl_idname)
+    if new_node.bl_idname == 'GeometryNodeGroup':
+        new_node.node_tree = source_node.node_tree
+    new_node.location = source_node.location + Vector((0, -200))
+    for i, orig_input in enumerate(source_node.inputs):
+        if hasattr(orig_input, "default_value"):
+            new_node.inputs[i].default_value = orig_input.default_value
+
+    new_empty = source_empty.copy()
+    if new_empty.data:
+        new_empty.data = source_empty.data.copy()
+    context.collection.objects.link(new_empty)
+    new_empty.parent = source_empty.parent
+
+    new_item = domain_obj.sdf_nodes.add()
+    new_empty.name = f"{source_item.name}{new_name_suffix}"
+    new_item.name = new_empty.name
+    new_item.empty_object = new_empty
+    
+    for prop in source_item.rna_type.properties.keys():
+        if prop not in ["name", "empty_object", "custom_control_points"]: # Exclude the collection itself
+            try:
+                setattr(new_item, prop, getattr(source_item, prop))
+            except (AttributeError, TypeError):
+                pass
+
+    # --- SPECIAL HANDLING FOR CURVE CUSTOM POINTS (THE FIX) ---
+    if source_item.icon == 'CURVE_BEZCURVE' and source_item.curve_control_mode == 'CUSTOM':
+        # Clear any default points on the new item's list
+        new_item.custom_control_points.clear()
+        
+        # Manually iterate and copy each control point and all of its properties
+        for source_point in source_item.custom_control_points:
+            new_point = new_item.custom_control_points.add()
+            
+            # Copy all properties from the source point to the new point
+            for point_prop in source_point.rna_type.properties.keys():
+                try:
+                    setattr(new_point, point_prop, getattr(source_point, point_prop))
+                except (AttributeError, TypeError):
+                    # This might happen for read-only properties, safe to ignore
+                    pass
+    # --- END OF FIX ---
+
+    new_node["associated_empty"] = new_empty.name
+
+    new_children = []
+    for child in source_empty.children:
+        new_child = child.copy()
+        if new_child.data:
+            new_child.data = child.data.copy()
+        context.collection.objects.link(new_child)
+        new_child.parent = new_empty
+        new_children.append(new_child)
+
+    if source_item.icon == 'MESH_CONE':
+        tip_child = next((c for c in new_children if "Tip" in c.name), None)
+        obj_inputs = [sock for sock in new_node.inputs if sock.type == 'OBJECT']
+        if len(obj_inputs) >= 2 and tip_child:
+            obj_inputs[0].default_value = new_empty
+            obj_inputs[1].default_value = tip_child
+    elif source_item.icon == 'CURVE_BEZCURVE':
+        curve_child = next((c for c in new_children if c.type == 'CURVE'), None)
+        obj_input = next((sock for sock in new_node.inputs if sock.type == 'OBJECT'), None)
+        if obj_input and curve_child:
+            obj_input.default_value = curve_child
+    else:
+        obj_input = next((sock for sock in new_node.inputs if sock.type == 'OBJECT'), None)
+        if obj_input:
+            obj_input.default_value = new_empty
+
+    return {"item": new_item, "empty": new_empty, "node": new_node}
 
 
+#---------------------------------------------------------------------------------------------------
 
+# In main.py, add this new helper function
+
+from mathutils import Matrix, Vector, Euler
+
+def _mirror_and_clone_shape(context, source_item, source_node, mirror_axis='X'):
+    """
+    A robust function to clone and mirror an SDF shape using a mathematically
+    sound matrix sanitization method to prevent flipping and child object issues.
+    """
+    domain = context.scene.sdf_domain
+    if not domain: return None
+
+    # 1. Create a perfect clone of the hierarchy and UI item
+    new_sdf = _clone_sdf_hierarchy(context, source_item, source_node, new_name_suffix=".Sym")
+    new_item = new_sdf["item"]
+    new_empty = new_sdf["empty"]
+
+    # Clones should not inherit the original's mirror settings
+    new_item.use_mirror_x = new_item.use_mirror_y = new_item.use_mirror_z = False
+    new_item.use_radial_mirror = False
+
+    # --- DEFINITIVE TRANSFORM LOGIC ---
+    source_empty = source_item.empty_object
+    
+    # 2. Define the mirror transformation matrix relative to the Domain's center
+    pivot = Matrix.Translation(domain.location)
+    pivot_inv = pivot.inverted()
+    
+    scale_vec = Vector((-1, 1, 1)) if mirror_axis == 'X' else \
+                Vector((1, -1, 1)) if mirror_axis == 'Y' else \
+                Vector((1, 1, -1))
+    scale_neg = Matrix.Diagonal(scale_vec).to_4x4()
+    mirror_matrix = pivot @ scale_neg @ pivot_inv
+
+    # 3. Apply and sanitize the PARENT's transform
+    new_mirrored_matrix = mirror_matrix @ source_empty.matrix_world
+    new_loc, new_rot, new_scl = new_mirrored_matrix.decompose()
+    new_scl.x, new_scl.y, new_scl.z = abs(new_scl.x), abs(new_scl.y), abs(new_scl.z)
+    new_empty.location = new_loc
+    new_empty.rotation_quaternion = new_rot
+    new_empty.scale = new_scl
+    
+    # CRITICAL: Force the dependency graph to update so all child transforms are recalculated
+    context.view_layer.update()
+
+    # 4. Sanitize CHILD transforms (THE FIX FOR CURVE AND CONE)
+    for child_new in new_empty.children:
+        # After the parent moves, the child's local matrix can become invalid (negative scale).
+        # We must decompose it, force the scale to be positive, and build it back up.
+        l, r, s = child_new.matrix_basis.decompose()
+        s.x, s.y, s.z = abs(s.x), abs(s.y), abs(s.z)
+        child_new.matrix_basis = Matrix.Translation(l) @ r.to_matrix().to_4x4() @ Matrix.Diagonal(s).to_4x4()
+
+    # 5. For the Cone, re-calculate its orientation now that transforms are stable
+    if new_item.icon == 'MESH_CONE':
+        tip_new = next((c for c in new_empty.children if "Tip" in c.name), None)
+        if tip_new:
+            # This function now receives valid world positions for both base and tip.
+            fix_scale_and_direction(new_empty, tip_new)
+
+    # 6. Negate Deformers and fix Pac-Man angle
+    if is_mirror_matrix(mirror_matrix):
+        if hasattr(new_item, "bend"): new_item.bend *= -1
+        if hasattr(new_item, "twist"): new_item.twist *= -1
+        if hasattr(new_item, "cylinder_bend"): new_item.cylinder_bend *= -1
+        if hasattr(new_item, "prism_bend"): new_item.prism_bend *= -1
+        if hasattr(new_item, "prism_twist"): new_item.prism_twist *= -1
+        
+        # PAC-MAN FIX: We don't reflect the angle value. The object's rotation
+        # is already mirrored, which correctly mirrors the opening.
+        # The old logic was causing the incorrect angle change you saw.
+        # So, we no longer modify sphere_cut_angle here.
+
+    return new_item
 
 #---------------------------------------------------------------------------------------------------
 
@@ -468,6 +805,27 @@ def get_dec_node(context):
 
 # -------------------------------------------------------------------
 
+def update_sdf_domain_scale(self, context):
+    """
+    Update callback for the domain scale slider.
+    Writes the value to the 'Domain Size' input on the SDF Domain node.
+    """
+    # This should not run when clipping is enabled, as that system controls the size.
+    if context.scene.clip_enabled:
+        return
+
+    node_tree = get_sdf_geometry_node_tree(context)
+    if not node_tree:
+        return
+        
+    domain_node = next((n for n in node_tree.nodes if n.name == "SDF Domain"), None)
+    if not domain_node:
+        return
+            
+    if "Domain Size" in domain_node.inputs:
+        domain_node.inputs["Domain Size"].default_value = context.scene.sdf_domain_scale
+
+
 from mathutils import Vector
 
 def update_sdf_global_scale(self, context):
@@ -571,64 +929,86 @@ def update_sdf_viewport_visibility(self, context):
 
 
 
-
-
-
-
 class SDF_UL_nodes(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
-        sdf_node = item
-        
-        is_valid = sdf_node.empty_object and sdf_node.empty_object.name in context.view_layer.objects
+            sdf_node = item
+            is_valid = sdf_node.empty_object and sdf_node.empty_object.name in context.view_layer.objects
 
-        if is_valid:
-            active_index = getattr(active_data, active_propname)
-            is_active = (data.sdf_nodes[active_index] == item) if 0 <= active_index < len(data.sdf_nodes) else False
-            
-            row = layout.row(align=True)
-            if is_active:
-                row.alert = True
-            
-            op = row.operator("object.select_empty", text=sdf_node.name, icon=sdf_node.icon, emboss=False)
-            op.empty_name = sdf_node.empty_object.name
+            if is_valid:
+                active_index = getattr(active_data, active_propname)
+                is_active = (data.sdf_nodes[active_index] == item) if 0 <= active_index < len(data.sdf_nodes) else False
+                
+                row = layout.row(align=True)
+                if is_active:
+                    row.alert = True
+                
+                op = row.operator("object.select_empty", text=sdf_node.name, icon=sdf_node.icon, emboss=False)
+                op.empty_name = sdf_node.empty_object.name
 
-            sub = row.row(align=True)
-            sub.alignment = 'RIGHT'
-            
-            # --- NEW: Highlight Toggle Button ---
-            # Use a different icon based on the state for better feedback
-            icon = 'RESTRICT_SELECT_ON' if sdf_node.use_highlight else 'RESTRICT_SELECT_OFF'
-            sub.prop(sdf_node, "use_highlight", text="", icon=icon, emboss=True)
-            # --- END NEW ---
+                sub = row.row(align=True)
+                sub.alignment = 'RIGHT'
+                
+                # The broken line referencing use_point_cloud_preview has been removed.
+                
+                highlight_icon = 'RESTRICT_SELECT_ON' if sdf_node.use_highlight else 'RESTRICT_SELECT_OFF'
+                sub.prop(sdf_node, "use_highlight", text="", icon=highlight_icon, emboss=True)
 
-            sub.prop(sdf_node, "is_viewport_hidden", text="", icon_only=True, emboss=True)
-            sub.prop(sdf_node, "is_hidden", text="")
+                sub.prop(sdf_node, "is_viewport_hidden", text="", icon_only=True, emboss=True)
+                sub.prop(sdf_node, "is_hidden", text="")
 
-        else:
-            row = layout.row(align=True)
-            row.label(text=f"'{sdf_node.name}' is broken!", icon='ERROR')
-            row.operator(PROTOTYPER_OT_SDFCleanupList.bl_idname, text="Clean List", icon='BRUSH_DATA')
+            else:
+                row = layout.row(align=True)
+                row.label(text=f"'{sdf_node.name}' is broken!", icon='ERROR')
+                row.operator("prototyper.sdf_cleanup_list", text="Clean List", icon='BRUSH_DATA')
+
+class SDF_UL_curve_points(bpy.types.UIList):
+    """The UIList for displaying custom curve control points."""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        point = item
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.label(text=f"Point at t={point.t_value:.2f}", icon='DECORATE_KEYFRAME')
+            layout.prop(point, "shape_type", text="")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='DECORATE_KEYFRAME')
+
+class PROTOTYPER_OT_SDFCurvePointAdd(bpy.types.Operator):
+    """Add a new control point to the active SDF Curve."""
+    bl_idname = "prototyper.sdf_curve_point_add"
+    bl_label = "Add Curve Control Point"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        if domain and 0 <= domain.active_sdf_node_index < len(domain.sdf_nodes):
+            item = domain.sdf_nodes[domain.active_sdf_node_index]
+            if item.icon == 'CURVE_BEZCURVE':
+                new_point = item.custom_control_points.add()
+                if len(item.custom_control_points) > 1:
+                    new_point.t_value = item.custom_control_points[-2].t_value + 0.2
+                item.active_control_point_index = len(item.custom_control_points) - 1
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFCurvePointRemove(bpy.types.Operator):
+    """Remove the selected control point from the active SDF Curve."""
+    bl_idname = "prototyper.sdf_curve_point_remove"
+    bl_label = "Remove Curve Control Point"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        if domain and 0 <= domain.active_sdf_node_index < len(domain.sdf_nodes):
+            item = domain.sdf_nodes[domain.active_sdf_node_index]
+            if item.icon == 'CURVE_BEZCURVE' and len(item.custom_control_points) > 0:
+                idx = item.active_control_point_index
+                item.custom_control_points.remove(idx)
+                item.active_control_point_index = min(max(0, idx - 1), len(item.custom_control_points) - 1)
+        return {'FINISHED'}             
 
 # -------------------------------------------------------------------
 # Operators for Object Selection and Mute Toggle
 # -------------------------------------------------------------------
 import sys, subprocess
-
-def ensure_pyopenvdb():
-    try:
-        import openvdb   # the C++ Python binding
-        return openvdb
-    except ImportError:
-        # 1) Make sure pip is available
-        subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"])
-        # 2) Install or upgrade pyopenvdb
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install",
-            "--upgrade", "pyopenvdb"
-        ])
-        # 3) Retry import
-        import openvdb
-        return openvdb
     
 
 # Pre-load your slice shader once at module scope:
@@ -650,13 +1030,13 @@ slice_batch  = batch_for_shader(slice_shader, 'TRI_STRIP',
                    {"pos": [(-1,-1),(1,-1),(-1,1),(1,1)]})
 
 
-
-
-def render_sdf_slices(resX, resY, depth, bounds_min, bounds_max):
+def setup_slice_baking(res_x, res_y):
     """
-    Renders SDF slices within a specific world-space bounding box provided by the caller.
+    Prepares all GPU resources for slice-by-slice baking.
+    Compiles the shader, collects and uploads all uniform data.
+    Returns the offscreen buffer, shader, and batch object.
     """
-    # --- Recompile the shader on every bake ---
+    # --- Compile the shader ---
     _slice_vert = textwrap.dedent("""\
         in vec2 pos;
         out vec2 uv;
@@ -672,60 +1052,111 @@ def render_sdf_slices(resX, resY, depth, bounds_min, bounds_max):
     slice_shader = GPUShader(_slice_vert, _slice_frag)
     slice_batch  = batch_for_shader(slice_shader, 'TRI_STRIP', {"pos": [(-1,-1),(1,-1),(-1,1),(1,1)]})
 
-    # --- Gather original WORLD-SPACE shape data ---
-    shapes   = collect_sdf_data(bpy.context)
-    uCount   = sum(1 for s in shapes if s[0] >= 0)
-    tf       = [int(s[0]) for s in shapes]
-    type_flat = [tf[i + j] for i in range(0, 32, 4) for j in range(4)]
-    pos_flat   = [f for s in shapes for f in s[1]]
+    # --- Gather and pack all data from the scene ---
+    shapes = collect_sdf_data(bpy.context)
+    MAX_SHAPES_CURRENT = bpy.context.scene.sdf_max_shapes
+    uCount = sum(1 for s in shapes if s[0] >= 0)
+    
+    tf = [int(s[0]) for s in shapes]
+    while len(tf) % 4 != 0: tf.append(-1)
+        
+    type_flat = [tf[i + j] for i in range(0, len(tf), 4) for j in range(4)]
+    pos_flat = [f for s in shapes for f in s[1]]
     scale_flat = [f for s in shapes for f in s[2]]
-    rot_flat   = [f for s in shapes for f in s[3]]
-    op_flat    = [int(s[4]) for s in shapes]
+    rot_flat = [f for s in shapes for f in s[3]]
+    op_flat = [int(s[4]) for s in shapes]
     blend_flat = [float(s[5]) for s in shapes]
+    mirror_flags_flat = [int(s[6]) for s in shapes]
+    radial_count_flat = [int(s[7]) for s in shapes]
+    item_id_flat = [int(s[10]) for s in shapes]
+    params1_flat = [v for s in shapes for v in s[11]]
+    params2_flat = [v for s in shapes for v in s[12]]
+    color_flat = [v for s in shapes for v in s[8]]
+    strength_flat = [float(s[13]) for s in shapes]
+    fill_flat = [float(s[14]) for s in shapes]
 
-    # --- Pack to byte buffers ---
-    type_buf  = array.array('i', type_flat).tobytes()
-    pos_buf   = array.array('f', pos_flat).tobytes()
+    type_buf = array.array('i', type_flat).tobytes()
+    pos_buf = array.array('f', pos_flat).tobytes()
     scale_buf = array.array('f', scale_flat).tobytes()
-    rot_buf   = array.array('f', rot_flat).tobytes()
-    op_buf    = array.array('i', op_flat).tobytes()
+    rot_buf = array.array('f', rot_flat).tobytes()
+    op_buf = array.array('i', op_flat).tobytes()
     blend_buf = array.array('f', blend_flat).tobytes()
+    mirror_flags_buf = array.array('i', mirror_flags_flat).tobytes()
+    radial_count_buf = array.array('i', radial_count_flat).tobytes()
+    item_id_buf = array.array('i', item_id_flat).tobytes()
+    params1_buf = array.array('f', params1_flat).tobytes()
+    params2_buf = array.array('f', params2_flat).tobytes()
+    color_buf = array.array('f', color_flat).tobytes()
+    strength_buf = array.array('f', strength_flat).tobytes()
+    fill_buf = array.array('f', fill_flat).tobytes()
 
-    # --- Set up off-screen rendering ---
-    offscreen = gpu.types.GPUOffScreen(resX, resY)
-    slices    = np.zeros((depth, resY, resX), dtype=np.float32)
+    # --- Set up off-screen rendering and upload uniforms ---
+    offscreen = gpu.types.GPUOffScreen(res_x, res_y)
+    
+    slice_shader.bind()
+    slice_shader.uniform_int("uCount", uCount)
+    slice_shader.uniform_float("uDomainCenter", bpy.context.scene.sdf_domain.location)
+    slice_shader.uniform_int("uColorBlendMode", 1 if bpy.context.scene.sdf_color_blend_mode == 'SOFT' else 0)
+
+    loc = slice_shader.uniform_from_name
+    slice_shader.uniform_vector_int(loc("uShapeTypePacked"), type_buf, 4, len(type_flat) // 4)
+    slice_shader.uniform_vector_float(loc("uShapePos"), pos_buf, 3, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeScale"), scale_buf, 3, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeRot"), rot_buf, 4, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_int(loc("uShapeOp"), op_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeBlend"), blend_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeBlendStrength"), strength_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeMaskFill"), fill_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_int(loc("uShapeMirrorFlags"), mirror_flags_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_int(loc("uShapeRadialCount"), radial_count_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_int(loc("uShapeItemID"), item_id_buf, 1, MAX_SHAPES_CURRENT)
+    slice_shader.uniform_vector_float(loc("uShapeColor"), color_buf, 3, MAX_SHAPES_CURRENT)
+
+    try: slice_shader.uniform_vector_float(loc("uShapeParams1"), params1_buf, 4, MAX_SHAPES_CURRENT)
+    except ValueError: pass
+    try: slice_shader.uniform_vector_float(loc("uShapeParams2"), params2_buf, 4, MAX_SHAPES_CURRENT)
+    except ValueError: pass
+
+    return offscreen, slice_shader, slice_batch
+
+
+def render_sdf_slices(resX, resY, depth, bounds_min, bounds_max):
+    """
+    Renders SDF slices and returns separate numpy grids for density and color channels.
+    This version is used by the DIRECT bake method.
+    """
+    # --- Use the new helper to prepare everything ---
+    offscreen, slice_shader, slice_batch = setup_slice_baking(resX, resY)
+
+    # --- Prepare result arrays ---
+    density_slices = np.zeros((depth, resY, resX), dtype=np.float32)
+    color_r_slices = np.zeros((depth, resY, resX), dtype=np.float32)
+    color_g_slices = np.zeros((depth, resY, resX), dtype=np.float32)
+    color_b_slices = np.zeros((depth, resY, resX), dtype=np.float32)
 
     with offscreen.bind():
         gpu.state.viewport_set(0, 0, resX, resY)
         slice_shader.bind()
         
-        # --- Pass the final, scaled bounding box and other uniforms ---
+        # Set uniforms that change per-slice
         slice_shader.uniform_float("uBoundsMin", bounds_min)
         slice_shader.uniform_float("uBoundsMax", bounds_max)
         slice_shader.uniform_int("uDepth", depth)
-        slice_shader.uniform_int("uCount", uCount)
-
-        # --- Upload uniform arrays ---
-        loc = slice_shader.uniform_from_name
-        slice_shader.uniform_vector_int(loc("uShapeTypePacked"), type_buf, 4, 8)
-        slice_shader.uniform_vector_float(loc("uShapePos"), pos_buf, 3, 32)
-        slice_shader.uniform_vector_float(loc("uShapeScale"), scale_buf, 3, 32)
-        slice_shader.uniform_vector_float(loc("uShapeRot"), rot_buf, 4, 32)
-        slice_shader.uniform_vector_int(loc("uShapeOp"), op_buf, 1, 32)
-        slice_shader.uniform_vector_float(loc("uShapeBlend"), blend_buf, 1, 32)
 
         framebuffer = gpu.state.active_framebuffer_get()
         for z in range(depth):
             slice_shader.uniform_int("uSliceIndex", z)
             slice_batch.draw(slice_shader)
             pixel_buffer = framebuffer.read_color(0, 0, resX, resY, 4, 0, 'FLOAT')
-            arr = np.array(pixel_buffer.to_list(), dtype=np.float32)
-            arr = arr.reshape(resY, resX, 4)
-            slices[z, :, :] = arr[:, :, 0]
+            arr = np.array(pixel_buffer.to_list(), dtype=np.float32).reshape(resY, resX, 4)
+            
+            density_slices[z, :, :] = arr[:, :, 0]
+            color_r_slices[z, :, :] = arr[:, :, 1]
+            color_g_slices[z, :, :] = arr[:, :, 2]
+            color_b_slices[z, :, :] = arr[:, :, 3]
 
     offscreen.free()
-    return slices
-
+    return density_slices, color_r_slices, color_g_slices, color_b_slices
 
 
 
@@ -755,10 +1186,94 @@ def write_vdb(slices, filepath, bounds_min, voxel_size):
 
     openvdb.write(filepath, grids=[grid])
 
+def bilinear_interpolate(grid_2d, points_2d):
+    """
+    Performs bilinear interpolation for a batch of 2D points in a 2D grid.
+    'grid_2d' is the 2D numpy array (Y, X, Channels).
+    'points_2d' is an (N, 2) numpy array of (x, y) coordinates.
+    """
+    height, width, channels = grid_2d.shape
+    x, y = points_2d[:, 0], points_2d[:, 1]
+
+    x0 = np.floor(x).astype(int)
+    y0 = np.floor(y).astype(int)
+    x1, y1 = x0 + 1, y0 + 1
+
+    x0 = np.clip(x0, 0, width - 1)
+    y0 = np.clip(y0, 0, height - 1)
+    x1 = np.clip(x1, 0, width - 1)
+    y1 = np.clip(y1, 0, height - 1)
+
+    c00 = grid_2d[y0, x0]
+    c10 = grid_2d[y0, x1]
+    c01 = grid_2d[y1, x0]
+    c11 = grid_2d[y1, x1]
+
+    wa = (x1 - x) * (y1 - y)
+    wb = (x - x0) * (y1 - y)
+    wc = (x1 - x) * (y - y0)
+    wd = (x - x0) * (y - y0)
+
+    return wa[:, np.newaxis] * c00 + wb[:, np.newaxis] * c10 + wc[:, np.newaxis] * c01 + wd[:, np.newaxis] * c11    
 
 
+def trilinear_interpolate(grid, points):
+    """
+    Performs trilinear interpolation for a batch of points in a 3D grid.
+    'grid' is the 3D numpy array (Z, Y, X).
+    'points' is an (N, 3) numpy array of (x, y, z) coordinates.
+    """
+    # Get grid dimensions
+    depth, height, width = grid.shape
+    
+    # --- FIX: Separate coordinates correctly from the (N, 3) array ---
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+
+    # Get lower and upper integer coordinates for each axis
+    x0 = np.floor(x).astype(int)
+    y0 = np.floor(y).astype(int)
+    z0 = np.floor(z).astype(int)
+    x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
+    # --- END FIX ---
+
+    # Clamp coordinates to be within grid bounds
+    x0 = np.clip(x0, 0, width - 1)
+    y0 = np.clip(y0, 0, height - 1)
+    z0 = np.clip(z0, 0, depth - 1)
+    x1 = np.clip(x1, 0, width - 1)
+    y1 = np.clip(y1, 0, height - 1)
+    z1 = np.clip(z1, 0, depth - 1)
+
+    # Calculate fractional distances
+    xd = x - x0
+    yd = y - y0
+    zd = z - z0
+
+    # Get values of the 8 surrounding voxels
+    c000 = grid[z0, y0, x0]
+    c100 = grid[z0, y0, x1]
+    c010 = grid[z0, y1, x0]
+    c110 = grid[z0, y1, x1]
+    c001 = grid[z1, y0, x0]
+    c101 = grid[z1, y0, x1]
+    c011 = grid[z1, y1, x0]
+    c111 = grid[z1, y1, x1]
+
+    # Interpolate along x-axis
+    c00 = c000 * (1 - xd) + c100 * xd
+    c01 = c001 * (1 - xd) + c101 * xd
+    c10 = c010 * (1 - xd) + c110 * xd
+    c11 = c011 * (1 - xd) + c111 * xd
+
+    # Interpolate along y-axis
+    c0 = c00 * (1 - yd) + c10 * yd
+    c1 = c01 * (1 - yd) + c11 * yd
+
+    # Interpolate along z-axis
+    return c0 * (1 - zd) + c1 * zd
 
 
+# Make sure these imports are at the top of your main.py file
 import os
 import bpy
 import numpy as np
@@ -766,242 +1281,580 @@ import gpu
 from gpu.types import GPUOffScreen
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
+import sys
+import subprocess
+import textwrap
+import array
+
 
 class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
+    """Creates a high-quality, retopologized mesh from the SDF Domain via a refinement pipeline"""
     bl_idname = "object.sdf_bake_volume"
     bl_label = "Bake SDF to High-Quality Mesh"
-    bl_description = "Creates a high-quality, retopologized mesh from the SDF Domain via a refinement pipeline"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # --- STAGE 1: BAKE SETTINGS ---
-    res: bpy.props.IntProperty(
-        name="Initial Resolution",
-        description="Voxels along the longest axis for the initial bake. Higher is more detailed",
-        default=256, min=32, max=1024
-    )
-    bake_scale: bpy.props.FloatProperty(
-        name="Bake Scale",
-        description="Multiplier for the bake volume size. >1.0 can help capture thin features",
-        default=1.0, min=0.1, max=10.0
-    )
-    filepath: bpy.props.StringProperty(
-        name="VDB File Path",
-        description="Filepath to write the intermediate VDB file",
-        default=os.path.expanduser("~/Desktop/sdf_bake.vdb"),
-        subtype='FILE_PATH'
-    )
-
-    # --- STAGE 2: RETOPOLOGY ---
-    retopology_method: bpy.props.EnumProperty(
-        name="Retopology Method",
-        description="Method to rebuild the mesh for better quality",
+    # --- Main Bake Properties ---
+    bake_method: bpy.props.EnumProperty(
+        name="Bake Method",
         items=[
-            ('NONE', "None", "Keep the raw mesh from the volume conversion (fast, low quality)"),
-            ('VOXEL', "Voxel Remesh", "Clean the mesh into uniform voxels (good for cleanup)"),
-            ('QUADRIFLOW', "QuadriFlow Remesh", "Rebuild with clean quad topology (slow, highest quality)"),
+            ('DIRECT', "Direct (PyMCubes)", "Fast, colored, but memory-intensive. Best for lower resolutions."),
+            ('VDB', "VDB (Geometry Only)", "Memory-efficient, high-resolution, but produces an uncolored mesh."),
+            ('HYBRID', "Hybrid (VDB + Color)", "Memory-efficient, high-resolution, and colored. Slower due to a second color-baking pass.")
         ],
-        default='QUADRIFLOW'
+        default='DIRECT'
     )
-    voxel_remesh_size: bpy.props.FloatProperty(
-        name="Voxel Size",
-        description="The size of the voxels for remeshing. Smaller values are very memory intensive",
-        default=0.01, min=0.001, soft_min=0.01, max=1.0, precision=4
-    )
-    quadriflow_target_faces: bpy.props.IntProperty(
-        name="Target Face Count",
-        description="The desired number of faces for the new mesh",
-        default=5000, min=100, max=100000
-    )
+    bake_colors: bpy.props.BoolProperty(name="Bake Vertex Colors",description="Export color information to the baked mesh. Only for Direct method.",default=True)
+    direct_method_smoothing: bpy.props.BoolProperty(name="Smooth Voxel Data",description="Pre-smooth the voxel data before meshing. Improves quality but is slower. Only for Direct method.",default=True)
+    res: bpy.props.IntProperty(name="Initial Resolution", default=256, min=32, max=4096)
+    bake_scale: bpy.props.FloatProperty(name="Bake Scale", default=1.0, min=0.1, max=10.0)
+    vdb_filepath: bpy.props.StringProperty(name="VDB File Path", default=os.path.expanduser("~/Desktop/sdf_bake.vdb"), subtype='FILE_PATH')
+    
+    # --- Texture Bake Properties ---
+    bake_to_texture: bpy.props.BoolProperty(name="Bake to Image Texture", default=False)
+    auto_uv_unwrap: bpy.props.BoolProperty(name="Auto UV Unwrap", default=True)
+    texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=256, max=4096)
 
-    # --- STAGE 3: POLISHING ---
-    add_subdivision_modifier: bpy.props.BoolProperty(
-        name="Add Subdivision Surface",
-        description="Add a Subdivision Surface modifier. Best used after retopology",
-        default=True
-    )
-    subdivision_levels: bpy.props.IntProperty(
-        name="Subdivision Levels",
-        default=2, min=1, max=6
-    )
-    add_smooth_modifier: bpy.props.BoolProperty(
-        name="Add Classic Smooth",
-        description="Add a classic Smooth modifier to even out geometry (Laplacian)",
+    # --- Retopology & Polish Properties ---
+    retopology_method: bpy.props.EnumProperty(name="Retopology Method", items=[('NONE', "None", ""), ('VOXEL', "Voxel Remesh", ""), ('QUADRIFLOW', "QuadriFlow Remesh", "")], default='QUADRIFLOW')
+    voxel_remesh_size: bpy.props.FloatProperty(name="Voxel Size", default=0.01, min=0.001, max=1.0, precision=4)
+    quadriflow_target_faces: bpy.props.IntProperty(name="Target Face Count", default=5000, min=100, max=100000)
+    add_subdivision_modifier: bpy.props.BoolProperty(name="Add Subdivision Surface", default=False)
+    subdivision_levels: bpy.props.IntProperty(name="Subdivision Levels", default=2, min=1, max=6)
+    add_smooth_modifier: bpy.props.BoolProperty(name="Add Classic Smooth", default=False)
+    smooth_factor: bpy.props.FloatProperty(name="Factor", default=0.5, min=0.0, max=2.0)
+    smooth_iterations: bpy.props.IntProperty(name="Iterations", default=5, min=1, max=30)
+    add_corrective_smooth_modifier: bpy.props.BoolProperty(name="Add Corrective Smooth", default=False)
+    shade_smooth: bpy.props.BoolProperty(name="Shade Smooth", default=False)
+
+    generate_splats: bpy.props.BoolProperty(
+        name="Generate Splats",
+        description="Generate a separate object with geometric splats scattered on the surface",
         default=False
     )
-    smooth_factor: bpy.props.FloatProperty(
-        name="Factor",
-        default=0.5, min=0.0, max=2.0
+    splat_shape: bpy.props.EnumProperty(
+        name="Shape",
+        items=[
+            ('SQUARE', "Square", ""),
+            ('CIRCLE', "Circle", ""),
+            ('TRIANGLE', "Triangle", "")
+        ],
+        default='SQUARE'
     )
-    smooth_iterations: bpy.props.IntProperty(
-        name="Iterations",
-        default=5, min=1, max=30
+    splat_density: bpy.props.FloatProperty(
+        name="Density",
+        description="Number of splats per square meter",
+        default=100.0, min=1.0, soft_max=1000.0
     )
-    add_corrective_smooth_modifier: bpy.props.BoolProperty(
-        name="Add Corrective Smooth",
-        description="Add a final smoothing pass to relax the mesh after subdivision",
-        default=True
+    splat_size_min: bpy.props.FloatProperty(
+        name="Min Size",
+        default=0.05, min=0.001, soft_max=1.0
     )
-    shade_smooth: bpy.props.BoolProperty(
-        name="Shade Smooth",
-        description="Automatically apply smooth shading to the final mesh",
-        default=True
+    splat_size_max: bpy.props.FloatProperty(
+        name="Max Size",
+        default=0.1, min=0.001, soft_max=20.0
     )
+    splat_rotation_min: bpy.props.FloatProperty(
+        name="Min Rotation",
+        subtype='ANGLE', default=0.0
+    )
+    splat_rotation_max: bpy.props.FloatProperty(
+        name="Max Rotation",
+        subtype='ANGLE', default=math.pi * 2
+    )
+    splat_height_min: bpy.props.FloatProperty(
+        name="Min Height",
+        description="Minimum distance to offset splats from the surface",
+        default=0.0, soft_min=-20.0, soft_max=20.0
+    )
+    splat_height_max: bpy.props.FloatProperty(
+        name="Max Height",
+        description="Maximum distance to offset splats from the surface",
+        default=0.0, soft_min=-20.0, soft_max=20.0
+    )
+    texture_path: bpy.props.StringProperty(
+        name="Output Path",
+        description="Directory to save the baked texture. Defaults to the blend file's location. If file is unsaved, defaults to Desktop",
+        subtype='DIR_PATH',
+        default="//"
+    )    
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=450)
 
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
         
-        box = layout.box()
-        box.label(text="Stage 1: Initial Bake", icon='VOLUME_DATA')
+        box = layout.box(); box.label(text="Stage 1: Initial Bake", icon='VOLUME_DATA')
         col = box.column()
+        col.prop(self, "bake_method", expand=True)
+        col.separator()
+        
+        if self.bake_method == 'DIRECT':
+            if not HAS_MCUBES: col.label(text="PyMCubes library not found!", icon='ERROR')
+            else:
+                sub = col.box()
+                sub.prop(self, "bake_colors")
+                sub.prop(self, "direct_method_smoothing")
+        elif self.bake_method in {'VDB', 'HYBRID'}:
+            if not HAS_OPENVDB: col.label(text="pyopenvdb library not found!", icon='ERROR')
+            else:
+                sub = col.box()
+                sub.prop(self, "vdb_filepath", text="VDB Path")
+        
         col.prop(self, "res")
         col.prop(self, "bake_scale")
-        col.prop(self, "filepath")
-
-        box = layout.box()
-        box.label(text="Stage 2: Retopology", icon='MOD_REMESH')
-        col = box.column()
-        col.prop(self, "retopology_method", text="Method")
-        if self.retopology_method == 'VOXEL':
-            sub = col.box()
-            sub.prop(self, "voxel_remesh_size")
-            domain = context.scene.sdf_domain
-            if domain:
-                dims = domain.dimensions * self.bake_scale
-                longest_axis = max(dims) if max(dims) > 0 else 1
-                estimated_voxels = (longest_axis / self.voxel_remesh_size)**3 if self.voxel_remesh_size > 0 else 0
-                if estimated_voxels > 25_000_000:
-                    warning_box = layout.box()
-                    warning_box.alert = True
-                    warning_box.label(text="WARNING: High voxel count!", icon='ERROR')
-                    warning_box.label(text="May cause Blender to freeze or crash.")
-        elif self.retopology_method == 'QUADRIFLOW':
-            sub = col.box()
-            sub.prop(self, "quadriflow_target_faces")
-
-        box = layout.box()
-        box.label(text="Stage 3: Final Polishing", icon='MOD_SMOOTH')
+        
+        box = layout.box(); box.label(text="Stage 2: Retopology", icon='MOD_REMESH')
+        col = box.column(); col.prop(self, "retopology_method", text="Method")
+        if self.retopology_method == 'VOXEL': sub = col.box(); sub.prop(self, "voxel_remesh_size")
+        elif self.retopology_method == 'QUADRIFLOW': sub = col.box(); sub.prop(self, "quadriflow_target_faces")
+            
+        box = layout.box(); box.label(text="Stage 3: Final Polishing", icon='MOD_SMOOTH')
         col = box.column()
         col.prop(self, "add_subdivision_modifier")
-        if self.add_subdivision_modifier:
-            sub = col.box()
-            sub.prop(self, "subdivision_levels")
+        if self.add_subdivision_modifier: sub = col.box(); sub.prop(self, "subdivision_levels")
         col.separator()
         col.prop(self, "add_smooth_modifier")
-        if self.add_smooth_modifier:
-            sub = col.box()
-            sub.prop(self, "smooth_factor")
-            sub.prop(self, "smooth_iterations")
+        if self.add_smooth_modifier: sub = col.box(); sub.prop(self, "smooth_factor"); sub.prop(self, "smooth_iterations")
         col.separator()
         col.prop(self, "add_corrective_smooth_modifier")
         col.separator()
         col.prop(self, "shade_smooth")
 
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=450)
+        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
+                    tex_box = layout.box()
+                    tex_box.label(text="Stage 6: Texture Output", icon='TEXTURE')
+                    tex_box.prop(self, "bake_to_texture")
+                    if self.bake_to_texture:
+                        sub_tex = tex_box.box()
+                        sub_tex.prop(self, "auto_uv_unwrap")
+                        sub_tex.prop(self, "texture_resolution", text="Resolution")
+                        sub_tex.prop(self, "texture_path")
+           
+        # --- NEW: SPLAT GENERATION UI ---
+        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
+            splat_box = layout.box()
+            splat_box.label(text="Stage 7: Splat Generation", icon='PARTICLES')
+            splat_box.prop(self, "generate_splats")
+            if self.generate_splats:
+                sub_splat = splat_box.box()
+                sub_splat.prop(self, "splat_shape", text="Shape")
+                sub_splat.prop(self, "splat_density", text="Density")
+                row = sub_splat.row(align=True)
+                row.prop(self, "splat_size_min", text="Min Size")
+                row.prop(self, "splat_size_max", text="Max Size")
+                row = sub_splat.row(align=True)
+                row.prop(self, "splat_rotation_min", text="Min Rot")
+                row.prop(self, "splat_rotation_max", text="Max Rot")
+                row = sub_splat.row(align=True)
+                row.prop(self, "splat_height_min", text="Min Height")
+                row.prop(self, "splat_height_max", text="Max Height")
+        # --- END NEW UI ---
 
+    def create_splat_object(self, context, source_object):
+        self.report({'INFO'}, "Generating live particle system for splats...")
+
+        # --- 1. Create the Splat Instance Geometry ---
+        if "Splat_Instances" in bpy.data.collections:
+            splat_collection = bpy.data.collections["Splat_Instances"]
+        else:
+            splat_collection = bpy.data.collections.new("Splat_Instances")
+            context.scene.collection.children.link(splat_collection)
+        
+        # Hide the collection from the viewport, but ensure it's not excluded from the view layer
+        context.view_layer.layer_collection.children[splat_collection.name].hide_viewport = True
+        context.view_layer.layer_collection.children[splat_collection.name].exclude = False
+
+        shape_name = f"Splat_{self.splat_shape.title()}"
+        if shape_name not in splat_collection.objects:
+            if self.splat_shape == 'SQUARE':
+                bpy.ops.mesh.primitive_plane_add(size=1)
+            elif self.splat_shape == 'CIRCLE':
+                bpy.ops.mesh.primitive_circle_add(vertices=16, fill_type='NGON')
+            else: # TRIANGLE
+                bpy.ops.mesh.primitive_circle_add(vertices=3, fill_type='NGON')
+            
+            splat_instance = context.active_object
+            splat_instance.name = shape_name
+            # Link to our special collection and unlink from the scene's active collection
+            splat_collection.objects.link(splat_instance)
+            context.collection.objects.unlink(splat_instance)
+
+        # --- 2. Add and Configure the Particle System ---
+        bpy.ops.object.select_all(action='DESELECT')
+        context.view_layer.objects.active = source_object
+        source_object.select_set(True)
+
+        bpy.ops.object.particle_system_add()
+        psys = source_object.particle_systems[-1]
+        psys.name = "SplatParticleSystem"
+        
+        psettings = psys.settings
+        psettings.type = 'HAIR'
+        psettings.use_advanced_hair = True
+        psettings.emit_from = 'FACE'
+        
+        # --- ROBUST PARTICLE COUNT CALCULATION ---
+        surface_area = sum(f.area for f in source_object.data.polygons)
+        particle_count = int(self.splat_density * surface_area)
+        
+        # If the area is tiny but > 0, ensure at least one splat is made
+        if particle_count == 0 and surface_area > 0:
+            particle_count = 1
+            
+        self.report({'INFO'}, f"Calculated Surface Area: {surface_area:.4f} m^2. Creating {particle_count} splats.")
+        psettings.count = particle_count
+        # --- END OF ROBUST COUNT ---
+        
+        # --- Render & Viewport Settings ---
+        psettings.render_type = 'COLLECTION'
+        psettings.instance_collection = splat_collection
+        psettings.particle_size = self.splat_size_min
+        psettings.size_random = (self.splat_size_max - self.splat_size_min) / self.splat_size_min if self.splat_size_min > 0 else 1.0
+        
+        # Explicitly tell the viewport to show the instances
+        psys.show_instancer_for_viewport = True
+        
+        # --- Rotation and Physics Settings ---
+        psettings.use_rotations = True
+        psettings.rotation_mode = 'NOR_TAN'
+        psettings.phase_factor = self.splat_rotation_min / (math.pi * 2)
+        psettings.phase_factor_random = (self.splat_rotation_max - self.splat_rotation_min) / (math.pi * 2)
+        
+        psettings.physics_type = 'NEWTON'
+        psettings.normal_factor = (self.splat_height_min + self.splat_height_max) / 2.0
+
+        # --- 3. Finalize ---
+        bpy.ops.object.select_all(action='DESELECT')
+        context.view_layer.objects.active = source_object
+        source_object.select_set(True)
+        self.report({'INFO'}, "Successfully added a live splat particle system.")
+        
     def execute(self, context):
-        domain = getattr(context.scene, "sdf_domain", None)
-        if not domain:
-            self.report({'ERROR'}, "SDF Domain object not found.")
+        # --- 0. PRE-CHECKS ---
+        if self.bake_method == 'DIRECT' and not HAS_MCUBES:
+            self.report({'ERROR'}, "PyMCubes library is required for the Direct method.")
+            return {'CANCELLED'}
+        if self.bake_method in {'VDB', 'HYBRID'} and not HAS_OPENVDB:
+            self.report({'ERROR'}, "pyopenvdb library is required for VDB/Hybrid methods.")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, "Stage 1: Baking SDF to Volume...")
-        
-        base_corners = [domain.matrix_world @ Vector(corner) for corner in domain.bound_box]
-        base_min = Vector(min(c[i] for c in base_corners) for i in range(3))
-        base_max = Vector(max(c[i] for c in base_corners) for i in range(3))
-        base_size = base_max - base_min
-        base_center = (base_min + base_max) / 2.0
-        final_size = base_size * self.bake_scale
-        final_min = base_center - (final_size / 2.0)
-        final_max = base_center + (final_size / 2.0)
+        domain = getattr(context.scene, "sdf_domain", None)
+        if not domain: self.report({'ERROR'}, "SDF Domain object not found."); return {'CANCELLED'}
 
-        longest_axis = max(final_size)
-        if longest_axis <= 0: return {'CANCELLED'}
-        voxel_size = longest_axis / self.res
-        res_x, res_y, res_z = [max(16, int(s / voxel_size)) for s in final_size]
+        # --- 1. SAVE ORIGINAL SCENE SETTINGS ---
+        scene = context.scene
+        original_engine = scene.render.engine
+        original_bake_settings = {
+            "use_selected_to_active": scene.render.bake.use_selected_to_active,
+            "margin": scene.render.bake.margin,
+            "use_cage": scene.render.bake.use_cage,
+            "cage_extrusion": scene.render.bake.cage_extrusion,
+        }
+        
+        final_mesh_object = None
 
         try:
-            slices = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
-            vdb_path = bpy.path.abspath(self.filepath)
-            os.makedirs(os.path.dirname(vdb_path), exist_ok=True)
-            write_vdb(slices, vdb_path, final_min, voxel_size)
-            bpy.ops.object.volume_import(filepath=vdb_path, align='WORLD', location=(0,0,0))
-            volume_object = context.view_layer.objects.active
-            volume_object.name = "SDF_Volume_Source"
-        except Exception as e:
-            self.report({'ERROR'}, f"Stage 1 failed: {e}")
-            return {'CANCELLED'}
+            # --- 2. FORCE SETTINGS FOR THIS OPERATOR ---
+            scene.render.bake.use_selected_to_active = False
+            scene.render.engine = 'BLENDER_EEVEE_NEXT' if hasattr(scene, 'eevee') else 'BLENDER_EEVEE'
 
-        final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", bpy.data.meshes.new("SDF_Mesh_Data"))
-        context.collection.objects.link(final_mesh_object)
-        
-        mod_v2m = final_mesh_object.modifiers.new(name="VolumeToMesh", type='VOLUME_TO_MESH')
-        mod_v2m.object = volume_object
-        mod_v2m.threshold = 0.0
-        
-        # --- NEW ROBUST METHOD ---
-        # 1. Get the dependency graph
-        depsgraph = context.evaluated_depsgraph_get()
-        # 2. Get the object with the modifier evaluated
-        object_eval = final_mesh_object.evaluated_get(depsgraph)
-        # 3. Create a new mesh datablock from the evaluated object
-        mesh_from_eval = bpy.data.meshes.new_from_object(object_eval)
-        # 4. Assign the new mesh data to our object
-        final_mesh_object.data = mesh_from_eval
-        # 5. Clean up by removing the modifier and the source volume
-        final_mesh_object.modifiers.clear()
-        bpy.data.objects.remove(volume_object, do_unlink=True)
-        # --- END OF ROBUST METHOD ---
+            self.report({'INFO'}, f"Preparing bake with '{self.bake_method}' method...")
+            base_corners = [domain.matrix_world @ Vector(corner) for corner in domain.bound_box]
+            base_min = Vector(min(c[i] for c in base_corners) for i in range(3)); base_max = Vector(max(c[i] for c in base_corners) for i in range(3))
+            base_size = base_max - base_min; base_center = (base_min + base_max) / 2.0
+            final_size = base_size * self.bake_scale; final_min = base_center - (final_size / 2.0); final_max = base_center + (final_size / 2.0)
+            longest_axis = max(final_size)
+            if longest_axis <= 0: return {'CANCELLED'}
+            voxel_size = longest_axis / self.res
+            res_x, res_y, res_z = [max(16, int(s / voxel_size)) for s in final_size]
+            col_r_grid, col_g_grid, col_b_grid = (None, None, None)
 
-        bpy.ops.object.select_all(action='DESELECT')
-        context.view_layer.objects.active = final_mesh_object
-        final_mesh_object.select_set(True)
+            # --- 3. MESH GENERATION ---
+            if self.bake_method == 'DIRECT':
+                try:
+                    density_grid, col_r_grid, col_g_grid, col_b_grid = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
+                except Exception as e: 
+                    self.report({'ERROR'}, f"Stage 1 failed during GPU rendering: {e}"); return {'CANCELLED'}
+                self.report({'INFO'}, "Stage 2: Generating Mesh via Marching Cubes...")
+                mesh_density_grid = mcubes.smooth(density_grid) if self.direct_method_smoothing else density_grid
+                verts, faces = mcubes.marching_cubes(mesh_density_grid, 0.0)
+                if len(verts) == 0: self.report({'WARNING'}, "Bake resulted in an empty mesh."); return {'CANCELLED'}
+                verts_np = np.array(verts)
+                verts_np[:, [0, 1, 2]] = verts_np[:, [2, 1, 0]]
+                verts_world = (verts_np * voxel_size) + np.array(final_min)
+                mesh_data = bpy.data.meshes.new("SDF_Mesh_Data"); mesh_data.from_pydata(verts_world.tolist(), [], faces.tolist()); mesh_data.update()
+                final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", mesh_data); context.collection.objects.link(final_mesh_object)
 
-        if self.retopology_method == 'VOXEL':
-            self.report({'INFO'}, "Stage 2: Applying Voxel Remesh...")
-            # Voxel Remesh is a modifier, so it's applied directly
-            mod_remesh = final_mesh_object.modifiers.new(name="SDF_VoxelRemesh", type='REMESH')
-            mod_remesh.mode = 'VOXEL'
-            mod_remesh.voxel_size = self.voxel_remesh_size
-            mod_remesh.use_smooth_shade = True
-            bpy.ops.object.modifier_apply(modifier=mod_remesh.name)
+            elif self.bake_method in {'VDB', 'HYBRID'}:
+                try:
+                    density_grid, _, _, _ = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
+                except Exception as e: self.report({'ERROR'}, f"Stage 1 failed during GPU rendering: {e}"); return {'CANCELLED'}
+                self.report({'INFO'}, "Stage 2: Writing VDB and converting to Mesh...")
+                try:
+                    vdb_path = bpy.path.abspath(self.vdb_filepath); os.makedirs(os.path.dirname(vdb_path), exist_ok=True)
+                    write_vdb(density_grid, vdb_path, final_min, voxel_size)
+                    bpy.ops.object.volume_import(filepath=vdb_path, align='WORLD', location=(0,0,0))
+                    volume_object = context.view_layer.objects.active; volume_object.name = "SDF_Volume_Source"
+                except Exception as e: self.report({'ERROR'}, f"Stage 2 (VDB) failed: {e}"); return {'CANCELLED'}
+                final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", bpy.data.meshes.new("SDF_Mesh_Data")); context.collection.objects.link(final_mesh_object)
+                mod_v2m = final_mesh_object.modifiers.new(name="VolumeToMesh", type='VOLUME_TO_MESH'); mod_v2m.object = volume_object; mod_v2m.threshold = 0.0
+                depsgraph = context.evaluated_depsgraph_get(); object_eval = final_mesh_object.evaluated_get(depsgraph)
+                mesh_from_eval = bpy.data.meshes.new_from_object(object_eval); final_mesh_object.data = mesh_from_eval
+                final_mesh_object.modifiers.clear(); bpy.data.objects.remove(volume_object, do_unlink=True)
 
-        elif self.retopology_method == 'QUADRIFLOW':
-            self.report({'INFO'}, "Stage 2: Applying QuadriFlow Remesh... (this may take a moment)")
-            # Now that we have real geometry, this operator will work correctly
-            bpy.ops.object.quadriflow_remesh(target_faces=self.quadriflow_target_faces, use_mesh_symmetry=False)
-        
-        else:
-            self.report({'INFO'}, "Stage 2: Skipping Retopology.")
+            if not final_mesh_object: self.report({'ERROR'}, "Mesh object was not created. Aborting."); return {'CANCELLED'}
+            bpy.ops.object.select_all(action='DESELECT'); context.view_layer.objects.active = final_mesh_object; final_mesh_object.select_set(True)
+            
+            # --- 4. POST-PROCESSING PIPELINE ---
+            if self.retopology_method == 'VOXEL':
+                self.report({'INFO'}, "Stage 3: Applying Voxel Remesh...")
+                bpy.ops.object.modifier_add(type='REMESH'); mod = final_mesh_object.modifiers[-1]
+                mod.mode = 'VOXEL'; mod.voxel_size = self.voxel_remesh_size; mod.use_smooth_shade = True
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+            elif self.retopology_method == 'QUADRIFLOW':
+                self.report({'INFO'}, "Stage 3: Applying QuadriFlow Remesh... (this may take a moment)")
+                bpy.ops.object.quadriflow_remesh(target_faces=self.quadriflow_target_faces, use_mesh_symmetry=False)
+            
+            self.report({'INFO'}, "Stage 4: Applying Final Polish...")
+            if self.add_subdivision_modifier:
+                bpy.ops.object.modifier_add(type='SUBSURF'); mod = final_mesh_object.modifiers[-1]
+                mod.levels = self.subdivision_levels; mod.render_levels = self.subdivision_levels
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+            if self.add_smooth_modifier:
+                bpy.ops.object.modifier_add(type='SMOOTH'); mod = final_mesh_object.modifiers[-1]
+                mod.factor = self.smooth_factor; mod.iterations = self.smooth_iterations
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+            if self.add_corrective_smooth_modifier:
+                bpy.ops.object.modifier_add(type='CORRECTIVE_SMOOTH')
+                bpy.ops.object.modifier_apply(modifier=final_mesh_object.modifiers[-1].name)
 
-        self.report({'INFO'}, "Stage 3: Applying Final Polish...")
-        
-        if self.add_subdivision_modifier:
-            mod_subdiv = final_mesh_object.modifiers.new(name="SDF_Subdivision", type='SUBSURF')
-            mod_subdiv.levels = self.subdivision_levels
-            mod_subdiv.render_levels = self.subdivision_levels
+            vcol_layer = None
+            if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
+                self.report({'INFO'}, "Stage 5: Applying vertex colors to final mesh...")
+                if self.bake_method == 'HYBRID':
+                    # ... (Your Hybrid vertex color logic) ...
+                    mw = final_mesh_object.matrix_world
+                    final_verts_count = len(final_mesh_object.data.vertices)
+                    final_verts_local = np.empty(final_verts_count * 3, dtype=np.float32)
+                    final_mesh_object.data.vertices.foreach_get('co', final_verts_local)
+                    final_verts_local = final_verts_local.reshape((final_verts_count, 3))
+                    final_verts_world = np.einsum('ij,aj->ai', np.array(mw), np.hstack((final_verts_local, np.ones((final_verts_count, 1)))))[:, :3]
+                    final_verts_voxel = (final_verts_world - np.array(final_min)) / voxel_size
+                    offscreen, slice_shader, slice_batch = setup_slice_baking(res_x, res_y)
+                    vert_colors = np.zeros((final_verts_count, 4), dtype=np.float32)
+                    with offscreen.bind():
+                        gpu.state.viewport_set(0, 0, res_x, res_y)
+                        slice_shader.bind()
+                        slice_shader.uniform_float("uBoundsMin", final_min)
+                        slice_shader.uniform_float("uBoundsMax", final_max)
+                        slice_shader.uniform_int("uDepth", res_z)
+                        framebuffer = gpu.state.active_framebuffer_get()
+                        for z in range(res_z):
+                            indices_in_slice = np.where((final_verts_voxel[:, 2] >= z) & (final_verts_voxel[:, 2] < z + 1))[0]
+                            if len(indices_in_slice) == 0: continue
+                            slice_shader.uniform_int("uSliceIndex", z)
+                            slice_batch.draw(slice_shader)
+                            pixel_buffer = framebuffer.read_color(0, 0, res_x, res_y, 4, 0, 'FLOAT')
+                            slice_arr = np.array(pixel_buffer.to_list(), dtype=np.float32).reshape(res_y, res_x, 4)
+                            points_in_slice = final_verts_voxel[indices_in_slice][:, :2]
+                            sampled_data = bilinear_interpolate(slice_arr, points_in_slice)
+                            vert_colors[indices_in_slice, 0] = sampled_data[:, 1]
+                            vert_colors[indices_in_slice, 1] = sampled_data[:, 2]
+                            vert_colors[indices_in_slice, 2] = sampled_data[:, 3]
+                            vert_colors[indices_in_slice, 3] = 1.0
+                    offscreen.free()
+                    colors_flat = vert_colors
+                else: # Direct Mode
+                    mw = final_mesh_object.matrix_world
+                    final_verts_count = len(final_mesh_object.data.vertices)
+                    final_verts_local = np.empty(final_verts_count * 3, dtype=np.float32)
+                    final_mesh_object.data.vertices.foreach_get('co', final_verts_local)
+                    final_verts_local = final_verts_local.reshape((final_verts_count, 3))
+                    final_verts_world = np.einsum('ij,aj->ai', np.array(mw), np.hstack((final_verts_local, np.ones((final_verts_count, 1)))))[:, :3]
+                    final_verts_voxel = (final_verts_world - np.array(final_min)) / voxel_size
+                    vert_colors_r = trilinear_interpolate(col_r_grid, final_verts_voxel)
+                    vert_colors_g = trilinear_interpolate(col_g_grid, final_verts_voxel)
+                    vert_colors_b = trilinear_interpolate(col_b_grid, final_verts_voxel)
+                    colors_flat = np.stack((vert_colors_r, vert_colors_g, vert_colors_b, np.ones_like(vert_colors_r)), axis=-1)
+                
+                vcol_name = "SDF_Color"
+                vcol_layer = final_mesh_object.data.vertex_colors.new(name=vcol_name)
+                loop_vert_indices = np.zeros(len(final_mesh_object.data.loops), dtype=np.int32)
+                final_mesh_object.data.loops.foreach_get('vertex_index', loop_vert_indices)
+                vcol_layer.data.foreach_set('color', colors_flat[loop_vert_indices].ravel())
+                
+                temp_mat = bpy.data.materials.new(name="SDF_VCol_Display")
+                temp_mat.use_nodes = True
+                nodes = temp_mat.node_tree.nodes
+                bsdf = nodes.get("Principled BSDF")
+                if bsdf:
+                    attr_node = nodes.new(type='ShaderNodeAttribute')
+                    attr_node.attribute_name = vcol_layer.name
+                    temp_mat.node_tree.links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
+                final_mesh_object.data.materials.append(temp_mat)
 
-        if self.add_smooth_modifier:
-            mod_smooth = final_mesh_object.modifiers.new(name="SDF_ClassicSmooth", type='SMOOTH')
-            mod_smooth.factor = self.smooth_factor
-            mod_smooth.iterations = self.smooth_iterations
+            if self.bake_to_texture and vcol_layer:
+                self.report({'INFO'}, "Stage 6: Baking vertex colors to image texture...")
+                scene.render.engine = 'CYCLES' # Temporarily switch to cycles for this part
+                
+                if self.auto_uv_unwrap or not final_mesh_object.data.uv_layers:
+                    self.report({'INFO'}, "Generating UVs with Smart UV Project...")
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.smart_project()
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                
+                # --- THIS IS THE FIX ---
+                if not final_mesh_object.data.uv_layers:
+                    self.report({'ERROR'}, "Bake to Texture requires UVs, but none could be found or generated.")
+                    return {'CANCELLED'}
+                if not final_mesh_object.data.uv_layers.active:
+                    final_mesh_object.data.uv_layers.active = final_mesh_object.data.uv_layers[0]
+                # --- END OF FIX ---
 
-        if self.add_corrective_smooth_modifier:
-            mod_smooth_corr = final_mesh_object.modifiers.new(name="SDF_CorrectiveSmooth", type='CORRECTIVE_SMOOTH')
-        
-        if self.shade_smooth and len(final_mesh_object.data.polygons) > 0:
-            final_mesh_object.data.polygons.foreach_set('use_smooth', [True] * len(final_mesh_object.data.polygons))
-            final_mesh_object.data.update()
+                bake_image = bpy.data.images.new(f"{final_mesh_object.name}_Color", width=self.texture_resolution, height=self.texture_resolution)
+                bake_mat = final_mesh_object.data.materials[0]
+                tree = bake_mat.node_tree
+                nodes = tree.nodes
+                vcol_attr_node = next((n for n in nodes if n.type == 'ATTRIBUTE' and n.attribute_name == vcol_layer.name), None)
+                if not vcol_attr_node:
+                    self.report({'ERROR'}, "Could not find the vertex color node for baking.")
+                else:
+                    emission_node = nodes.new(type='ShaderNodeEmission')
+                    tree.links.new(vcol_attr_node.outputs['Color'], emission_node.inputs['Color'])
+                    bsdf = nodes.get("Principled BSDF")
+                    output_node = nodes.get("Material Output")
+                    original_link = None
+                    if bsdf and bsdf.outputs['BSDF'].links: original_link = bsdf.outputs['BSDF'].links[0]
+                    tree.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
+                    img_node = nodes.new(type='ShaderNodeTexImage'); img_node.image = bake_image; nodes.active = img_node
+                    scene.cycles.bake_type = 'EMIT'
+                    bpy.ops.object.bake(type='EMIT')
+                    
+                    resolved_path = bpy.path.abspath(self.texture_path)
+                    if resolved_path: output_dir = resolved_path
+                    else:
+                        self.report({'INFO'}, "No valid path set or blend file is unsaved. Using Desktop as fallback.")
+                        desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+                        output_dir = desktop_dir if os.path.isdir(desktop_dir) else bpy.app.tempdir
+                    os.makedirs(output_dir, exist_ok=True)
+                    filename = f"{final_mesh_object.name}_Color.png"
+                    filepath = os.path.join(output_dir, filename)
+                    self.report({'INFO'}, f"Saved baked texture to: {filepath}")
+                    bake_image.save_render(filepath=filepath)
+                    
+                    if original_link: tree.links.new(original_link.from_socket, original_link.to_socket)
+                    nodes.remove(emission_node); nodes.remove(vcol_attr_node)
+                    if bsdf: tree.links.new(img_node.outputs['Color'], bsdf.inputs['Base Color'])
 
-        self.report({'INFO'}, "Bake and refinement pipeline completed successfully!")
+            if self.shade_smooth and len(final_mesh_object.data.polygons) > 0:
+                final_mesh_object.data.polygons.foreach_set('use_smooth', [True] * len(final_mesh_object.data.polygons)); final_mesh_object.data.update()
+                
+            if self.generate_splats:
+                self.create_splat_object(context, final_mesh_object)     
+                
+            self.report({'INFO'}, "Bake and refinement pipeline completed successfully!")
+            
+        finally:
+            # --- 5. RESTORE ORIGINAL SCENE SETTINGS ---
+            self.report({'INFO'}, "Restoring original scene settings.")
+            scene.render.engine = original_engine
+            scene.render.bake.use_selected_to_active = original_bake_settings["use_selected_to_active"]
+            scene.render.bake.margin = original_bake_settings["margin"]
+            scene.render.bake.use_cage = original_bake_settings["use_cage"]
+            scene.render.bake.cage_extrusion = original_bake_settings["cage_extrusion"]
+            
         return {'FINISHED'}
 
 
 
 
+class OBJECT_OT_sdf_bake_to_remesh(bpy.types.Operator):
+    """Sets up the scene for a 'Selected to Active' bake and opens the Bake Panel.
+    
+    Select the source object, then SHIFT-select the target remesh object to make it active.
+    """
+    bl_idname = "object.sdf_bake_to_remesh"
+    bl_label = "Bake Selected to Active"
+    bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        # This operator is only clickable if there is an active object and at least one other object selected.
+        return context.active_object and len(context.selected_objects) > 1
+
+    def execute(self, context):
+        scene = context.scene
+        
+        # 1. Switch to Cycles, which is required for baking
+        self.report({'INFO'}, "Switching to Cycles Render Engine for baking.")
+        scene.render.engine = 'CYCLES'
+        
+        # 2. Set the bake mode to 'Selected to Active'
+        scene.render.bake.use_selected_to_active = True
+        
+        # 3. Open the main Render Properties tab and scroll to the Bake panel for the user
+        for area in context.screen.areas:
+            if area.type == 'PROPERTIES':
+                area.spaces.active.context = 'RENDER'
+                # While we can't force a scroll, opening the tab is the most we can do.
+                break
+        
+        self.report({'INFO'}, "Setup complete. Please configure settings in the Bake panel and click 'Bake'.")
+        return {'FINISHED'}
+
+
+# In main.py, add these two new operator classes
+
+class OBJECT_OT_sdf_auto_uv(bpy.types.Operator):
+    """Applies a Smart UV Project to the active object"""
+    bl_idname = "object.sdf_auto_uv"
+    bl_label = "Auto UV Selected Object"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # This operator can only run if there is an active object and it's a mesh.
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        self.report({'INFO'}, f"Generating Smart UVs for '{obj.name}'...")
+        
+        # We must be in edit mode to perform the unwrap
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.uv.smart_project(angle_limit=math.radians(66))
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        self.report({'INFO'}, "UV unwrapping complete.")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_sdf_snap_selection_to_active(bpy.types.Operator):
+    """Snaps the transform (location, rotation, scale) of selected objects to the active object"""
+    bl_idname = "object.sdf_snap_selection_to_active"
+    bl_label = "Snap Selection to Active"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        # Requires at least two objects to be selected (one active, one or more others)
+        return context.active_object and len(context.selected_objects) > 1
+
+    def execute(self, context):
+        active_obj = context.active_object
+        selected_objs = [obj for obj in context.selected_objects if obj != active_obj]
+        
+        self.report({'INFO'}, f"Snapping {len(selected_objs)} object(s) to '{active_obj.name}'...")
+        
+        for obj in selected_objs:
+            # The most robust way to snap is to copy the entire world matrix
+            obj.matrix_world = active_obj.matrix_world.copy()
+            
+        return {'FINISHED'}
 
 class OBJECT_OT_reset_brush_cube_transform(bpy.types.Operator):
     """Reset the Brush Cube transform to default (centered and with default rotation/scale)"""
@@ -1531,88 +2384,97 @@ def calculate_combined_bounds(objects):
 
 def rewire_full_sdf_chain(context):
     """
-    The master rewiring function for the entire SDF node chain.
-    This version uses the correct API to modify the node tree's interface.
+    The master rewiring function. This version correctly wires the SDF chain
+    to the SDF Domain, and then switches the Domain's output between the final
+    mesh or a point cloud converter.
     """
+    if not context:
+        print("[Rogue SDF AI] Rewire called with invalid context. Aborting.")
+        return
+
     scene = context.scene
     node_tree = get_sdf_geometry_node_tree(context)
-    if not node_tree:
-        return
+    if not node_tree: return
 
-    # 1. Find all the essential nodes
+    # --- 1. Get all essential nodes (we can now assume they exist) ---
+    out_node = next((n for n in node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
     domain_node = next((n for n in node_tree.nodes if n.name == "SDF Domain"), None)
     dec_node = get_dec_node(context)
-    out_node = next((n for n in node_tree.nodes if n.type == 'GROUP_OUTPUT'), None)
+    points_output_node = next((n for n in node_tree.nodes if "SDF Points Output" in n.name), None)
 
-    if not domain_node or not out_node:
-        print("[Rogue SDF AI] ERROR: Missing essential Domain or Output node.")
+    if not all([domain_node, out_node, points_output_node]):
+        print("[Rogue SDF AI] Essential nodes are missing from the node tree. Please regenerate the domain.")
         return
-
-    # --- THE CORRECT API FIX ---
-    # We check the tree's interface to see if a "Geometry" OUTPUT socket exists.
-    # This corresponds to an INPUT on the Group Output node inside the tree.
-    if not any(item.name == "Geometry" and item.item_type == 'SOCKET' and item.in_out == 'OUTPUT' for item in node_tree.interface.items_tree):
-        # If it doesn't exist, create it on the tree's interface. This is the correct method.
-        node_tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-
-    # Now that we're sure the interface socket exists, we can safely get the corresponding input on the node.
-    output_geo_in = out_node.inputs.get("Geometry")
-    if not output_geo_in:
-        print("[Rogue SDF AI] FATAL ERROR: Could not find or create 'Geometry' input on Group Output node.")
-        return
-    # ---
-
-    # 2. Get an ordered list of the active SDF shape nodes
-    chain_nodes = []
-    if hasattr(context.scene.sdf_domain, 'sdf_nodes'):
-        chain_nodes = [
-            next((n for n in node_tree.nodes if n.get("associated_empty") == item.empty_object.name), None)
-            for item in context.scene.sdf_domain.sdf_nodes if item.empty_object and not item.is_hidden
-        ]
-        chain_nodes = [n for n in chain_nodes if n is not None]
-
-    # 3. Clear all incoming links to the SDF inputs
-    all_sdf_inputs = [node.inputs[0] for node in chain_nodes if node.inputs]
-    if domain_node.inputs:
-        all_sdf_inputs.append(domain_node.inputs[0])
-    for sdf_input_socket in all_sdf_inputs:
-        for link in list(sdf_input_socket.links):
-            node_tree.links.remove(link)
-
-    # 4. Connect the shapes to each other in sequence
-    if len(chain_nodes) > 1:
-        for i in range(len(chain_nodes) - 1):
-            node_tree.links.new(chain_nodes[i].outputs[0], chain_nodes[i+1].inputs[0])
     
-    # 5. Connect the last shape to the Domain's SDF input
-    if chain_nodes:
-        node_tree.links.new(chain_nodes[-1].outputs[0], domain_node.inputs[0])
+    if not any(item.name == "Geometry" and item.item_type == 'SOCKET' and item.in_out == 'OUTPUT' for item in node_tree.interface.items_tree):
+        node_tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    output_geo_in = out_node.inputs.get("Geometry")
+    if not output_geo_in: return
 
-    # 6. Find the Domain's "Mesh" output socket
-    domain_geo_out = domain_node.outputs.get("Mesh")
-    if not domain_geo_out:
-        print("[Rogue SDF AI] FATAL ERROR: The 'SDF Domain' node has no output socket named 'Mesh'.")
+    # --- 2. Clear ONLY the links that will be re-established ---
+    if output_geo_in.is_linked:
+        for link in list(output_geo_in.links): node_tree.links.remove(link)
+    if domain_node.inputs[0].is_linked:
+        for link in list(domain_node.inputs[0].links): node_tree.links.remove(link)
+    if points_output_node.inputs[0].is_linked:
+        for link in list(points_output_node.inputs[0].links): node_tree.links.remove(link)
+    if dec_node and dec_node.inputs["Geometry"].is_linked:
+        for link in list(dec_node.inputs["Geometry"].links): node_tree.links.remove(link)
+
+    # --- 3. Get all active SDF shape nodes ---
+    active_shape_nodes = []
+    if hasattr(scene.sdf_domain, 'sdf_nodes'):
+        for item in scene.sdf_domain.sdf_nodes:
+            if item.empty_object and not item.is_hidden:
+                node = next((n for n in node_tree.nodes if n.get("associated_empty") == item.empty_object.name), None)
+                if node:
+                    active_shape_nodes.append(node)
+
+    # --- 4. Build the single, sequential SDF chain ---
+    if not active_shape_nodes:
+        node_tree.links.new(domain_node.outputs["Mesh"], output_geo_in)
+        print("[Rogue SDF AI] No active shapes. Node chain is empty.")
         return
 
-    # 7. Clear any links currently going into the final Group Output.
-    for link in list(output_geo_in.links):
-        node_tree.links.remove(link)
+    item_names = [item.name for item in scene.sdf_domain.sdf_nodes]
+    def get_sort_key(node):
+        try:
+            return item_names.index(node.get("associated_empty"))
+        except (ValueError, TypeError):
+            return 999
+            
+    sorted_nodes = sorted(active_shape_nodes, key=get_sort_key)
 
-    # 8. Decide the connection based on whether decimation is enabled.
-    if scene.sdf_decimation_enable and dec_node:
-        decimate_geo_in = dec_node.inputs.get("Geometry")
-        decimate_geo_out = dec_node.outputs.get("Geometry")
-        if decimate_geo_in and decimate_geo_out:
-            for link in list(decimate_geo_in.links):
-                node_tree.links.remove(link)
-            node_tree.links.new(domain_geo_out, decimate_geo_in)
-            node_tree.links.new(decimate_geo_out, output_geo_in)
+    for i in range(len(sorted_nodes) - 1):
+        next_input = sorted_nodes[i+1].inputs[0]
+        if next_input.is_linked:
+            for link in list(next_input.links): node_tree.links.remove(link)
+        node_tree.links.new(sorted_nodes[i].outputs[0], next_input)
+    
+    final_sdf_field = sorted_nodes[-1].outputs[0]
+
+    # --- 5. ALWAYS connect the SDF chain to the SDF Domain ---
+    domain_node.mute = False
+    node_tree.links.new(final_sdf_field, domain_node.inputs[0])
+    domain_mesh_output = domain_node.outputs["Mesh"]
+
+    # --- 6. Switch the FINAL GEOMETRY based on the visualization mode ---
+    if scene.sdf_visualization_mode == 'SOLID':
+        points_output_node.mute = True
+        if scene.sdf_decimation_enable and dec_node:
+            dec_node.mute = False
+            node_tree.links.new(domain_mesh_output, dec_node.inputs["Geometry"])
+            node_tree.links.new(dec_node.outputs["Geometry"], output_geo_in)
         else:
-            node_tree.links.new(domain_geo_out, output_geo_in)
-    else:
-        node_tree.links.new(domain_geo_out, output_geo_in)
+            if dec_node: dec_node.mute = True
+            node_tree.links.new(domain_mesh_output, output_geo_in)
+    else: # 'POINTS' mode
+        if dec_node: dec_node.mute = True
+        points_output_node.mute = False
+        node_tree.links.new(domain_mesh_output, points_output_node.inputs[0])
+        node_tree.links.new(points_output_node.outputs[0], output_geo_in)
 
-    print("[Rogue SDF AI] Node chain rewired successfully.")
+    print(f"[Rogue SDF AI] Node chain rewired for '{scene.sdf_visualization_mode}' mode.")
 
 #----------------------------------------------------------------------
 
@@ -1725,7 +2587,7 @@ def depsgraph_update(scene):
 
 import bpy
 
-# In main.py, replace the ENTIRE SDFPrototyperPanel class with this final, corrected version.
+# In main.py, replace the ENTIRE SDFPrototyperPanel class with this one.
 
 class SDFPrototyperPanel(bpy.types.Panel):
     bl_label      = "Rogue SDF AI"
@@ -1747,20 +2609,21 @@ class SDFPrototyperPanel(bpy.types.Panel):
             layout.operator("object.start_sdf", text="Generate SDF", icon='GEOMETRY_NODES')
             return
 
-        box = layout.box()
-        box.label(text="Global Controls", icon='SETTINGS')
-        col = box.column(align=True)
-        col.prop(scene, "sdf_max_shapes")
-        row = col.row(align=True)
-        row.prop(scene, "sdf_global_scale", text="Scale")
-        row.operator("object.reset_sdf_global_scale", text="", icon='FILE_REFRESH')
-        col.prop(scene, "sdf_auto_resolution_enable", text="Automatic Preview", icon='AUTO')
+        # ... (The first part of the panel is unchanged)
+        res_box = layout.box()
+        res_box.label(text="Domain Settings", icon='OBJECT_DATA')
+        res_col = res_box.column(align=True)
+        row_scale = res_col.row(align=True)
+        row_scale.prop(scene, "sdf_domain_scale", text="Domain Scale")
+        row_scale.enabled = not scene.clip_enabled
+        res_col.separator()
+        res_col.prop(scene, "sdf_auto_resolution_enable", text="Automatic Preview", icon='AUTO')
         if scene.sdf_auto_resolution_enable:
-            auto = box.box()
+            auto = res_box.box()
             ac = auto.column(align=True)
             ac.prop(scene, "sdf_auto_threshold", text="Sensitivity")
             ac.prop(scene, "sdf_auto_idle_delay", text="Idle Delay (s)")
-        sbox = box.box()
+        sbox = res_box.box()
         sc = sbox.column()
         mr = sc.row(align=True)
         mr.enabled = not scene.sdf_auto_resolution_enable
@@ -1769,9 +2632,16 @@ class SDFPrototyperPanel(bpy.types.Panel):
         rr.prop(scene, "sdf_preview_resolution", text="Low-Res")
         rr.prop(scene, "sdf_final_resolution",   text="High-Res")
         if scene.sdf_auto_resolution_enable:
-            st = box.row()
+            st = res_box.row()
             st.label(text="Status:")
             st.label(text=scene.sdf_status_message)
+        box = layout.box()
+        box.label(text="Global Controls", icon='SETTINGS')
+        col = box.column(align=True)
+        col.prop(scene, "sdf_max_shapes")
+        row = col.row(align=True)
+        row.prop(scene, "sdf_global_scale", text="Shape Scale")
+        row.operator("object.reset_sdf_global_scale", text="", icon='FILE_REFRESH')
         dnode = get_dec_node(context)
         r = box.row(align=True)
         r.operator(OBJECT_OT_ToggleDecimation.bl_idname, text="Enable Decimation", icon='MOD_DECIM', depress=(dnode is not None))
@@ -1780,10 +2650,12 @@ class SDFPrototyperPanel(bpy.types.Panel):
             for inp in dnode.inputs:
                 if inp.name != "Geometry":
                     sub.prop(inp, "default_value", text=inp.name)
-
         layout.separator()
         row = layout.row()
         row.operator("view3d.toggle_sdf_overlays", text="Toggle Overlays", icon='OVERLAY')
+        view_box = layout.box()
+        view_box.label(text="View Filter", icon='HIDE_OFF')
+        view_box.prop(scene, "sdf_view_mode", expand=True)
         row = layout.row()
         row.template_list("SDF_UL_nodes", "", domain, "sdf_nodes", domain, "active_sdf_node_index", rows=4)
         ops = row.column(align=True)
@@ -1791,21 +2663,29 @@ class SDFPrototyperPanel(bpy.types.Panel):
         ops.operator("prototyper.sdf_repeat_shape", icon='MOD_ARRAY', text="")
         ops.operator("prototyper.sdf_delete",       icon='REMOVE',    text="")
         ops.separator()
-        up = ops.operator("prototyper.sdf_list_move", icon='TRIA_UP', text="")
-        up.direction = 'UP'
-        dn = ops.operator("prototyper.sdf_list_move", icon='TRIA_DOWN', text="")
-        dn.direction = 'DOWN'
+        up = ops.operator("prototyper.sdf_list_move", icon='TRIA_UP', text=""); up.direction = 'UP'
+        dn = ops.operator("prototyper.sdf_list_move", icon='TRIA_DOWN', text=""); dn.direction = 'DOWN'
         ops.separator()
         ops.operator("prototyper.sdf_clear",        icon='X',         text="")
-        
         layout.separator()
         layout.prop(scene, "sdf_shader_view", text="Enable SDF Shader View", icon='SHADING_RENDERED')
         if scene.sdf_shader_view:
-            light = layout.box()
-            light.label(text="Preview Light", icon='LIGHT_HEMI')
-            light.prop(scene, "sdf_light_azimuth",   text="Azimuth")
-            light.prop(scene, "sdf_light_elevation", text="Elevation")
+            light_box = layout.box()
+            light_box.label(text="Advanced Preview Lighting", icon='MATERIAL')
             
+            col = light_box.column()
+            col.prop(scene, "sdf_light_direction", text="")
+            col.separator()
+            row = col.row(align=True)
+            row.prop(scene, "sdf_preview_brightness")
+            row.prop(scene, "sdf_preview_contrast")
+            col.separator()
+            cavity_box = light_box.box()
+            row = cavity_box.row()
+            row.prop(scene, "sdf_cavity_enable")
+            row_cavity = cavity_box.row()
+            row_cavity.enabled = scene.sdf_cavity_enable
+            row_cavity.prop(scene, "sdf_cavity_strength")
         layout.separator()
         shape_box = layout.box()
         shape_box.label(text="Shape Settings", icon='MODIFIER_DATA')
@@ -1827,7 +2707,28 @@ class SDFPrototyperPanel(bpy.types.Panel):
                         sc2 = sb.column(align=True)
                         sc2.prop(scene, "sdf_global_tint", text="Global Tint")
                         sc2.prop(item, "operation", text="Operation")
-                        sc2.prop(item, "blend", text="Blend")
+                        if item.operation in {'UNION', 'SUBTRACT', 'INTERSECT'}:
+                            sc2.prop(item, "blend_type", text="Blend Type")
+                            blend_label = "Chamfer Size" if item.blend_type == 'CHAMFER' else "Smoothness"
+                            sc2.prop(item, "blend", text=blend_label)
+                        elif item.operation in {'DISPLACE', 'INDENT', 'RELIEF', 'ENGRAVE'}:
+                            sc2.prop(item, "blend_strength", text="Strength")
+                            sc2.prop(item, "blend", text="Smoothness")
+                        elif item.operation == 'MASK':
+                            sc2.prop(item, "blend_strength", text="Shell Thickness")
+                            sc2.prop(item, "blend", text="Edge Smoothness")
+                        elif item.operation == 'PAINT':
+                             sc2.prop(item, "blend_strength", text="Feather")
+                        if item.icon == 'MESH_CUBE':
+                            sc2.prop(item, "thickness"); sc2.prop(item, "roundness"); sc2.prop(item, "bevel"); sc2.prop(item, "pyramid"); sc2.prop(item, "twist"); sc2.prop(item, "bend")
+                        elif item.icon == 'MESH_UVSPHERE':
+                            sc2.prop(item, "sphere_thickness"); sc2.prop(item, "sphere_elongation"); sc2.prop(item, "sphere_cut_angle")
+                        elif item.icon == 'MESH_CYLINDER':
+                            sc2.prop(item, "cylinder_thickness"); sc2.prop(item, "cylinder_roundness"); sc2.prop(item, "cylinder_pyramid"); sc2.prop(item, "cylinder_bend")
+                        elif item.icon == 'MESH_ICOSPHERE':
+                            sc2.prop(item, "prism_sides"); sc2.prop(item, "prism_thickness"); sc2.separator(); sc2.label(text="Deformers:"); sc2.prop(item, "prism_pyramid"); sc2.prop(item, "prism_bend"); sc2.prop(item, "prism_twist")
+                        elif item.icon == 'MESH_TORUS':
+                            sc2.prop(item, "torus_outer_radius"); sc2.prop(item, "torus_inner_radius"); sc2.prop(item, "torus_thickness"); sc2.prop(item, "torus_cut_angle"); sc2.prop(item, "torus_elongation")
                         sc2.prop(item, "preview_color", text="Color")
                         sc2.prop(scene, "sdf_color_blend_mode", text="Color Blend")
                     else:
@@ -1839,9 +2740,9 @@ class SDFPrototyperPanel(bpy.types.Panel):
                         if scene.sdf_shape_tab == 'DEFORM':
                             row3 = col3.row(align=True)
                             row3.label(text="Flip Shape:")
-                            row3.operator(PROTOTYPER_OT_SDFFlipShape.bl_idname, text="X").axis = 'X'
-                            row3.operator(PROTOTYPER_OT_SDFFlipShape.bl_idname, text="Y").axis = 'Y'
-                            row3.operator(PROTOTYPER_OT_SDFFlipShape.bl_idname, text="Z").axis = 'Z'
+                            op_x = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="X"); op_x.axis = 'X'
+                            op_y = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Y"); op_y.axis = 'Y'
+                            op_z = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Z"); op_z.axis = 'Z'
                             col3.separator()
                         for sock in node.inputs:
                             key = sock.name.lower()
@@ -1849,15 +2750,78 @@ class SDFPrototyperPanel(bpy.types.Panel):
                             show = ((tab=='BASIC' and any(k in key for k in ("radius","width","height","depth","size"))) or (tab=='DEFORM' and any(k in key for k in ("bend","twist","taper","scale"))) or (tab=='STYLE' and any(k in key for k in ("blend","style","soft","round"))) or (tab=='MISC' and not any(k in key for k in ("sdf","slice","object"))))
                             if show:
                                 col3.prop(sock, "default_value", text=sock.name)
-
                     if item.icon == 'CURVE_BEZCURVE':
                         curve_box = b.box()
                         curve_box.label(text="Curve Settings", icon='CURVE_DATA')
                         ccol = curve_box.column(align=True)
                         ccol.prop(item, "curve_mode", expand=True)
-                        if item.curve_mode == 'SMOOTH':
-                            ccol.prop(item, "curve_subdivisions")
-                    
+                        ccol.prop(item, "curve_control_mode", expand=True)
+                        if item.curve_control_mode == 'UNIFORM':
+                            uniform_box = ccol.box()
+                            ucol = uniform_box.column(align=True)
+                            ucol.prop(item, "curve_instance_type", text="Shape")
+                            ucol.prop(item, "curve_point_density")
+                            ucol.prop(item, "curve_instance_spacing", text="Spacing")
+                            ucol.prop(item, "curve_instance_rotation", text="Rotation")
+                            inst_box = uniform_box.box()
+                            inst_box.label(text=f"{item.curve_instance_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
+                            icol = inst_box.column(align=True)
+                            if item.curve_instance_type == 'MESH_CUBE':
+                                icol.prop(item, "thickness"); icol.prop(item, "roundness"); icol.prop(item, "bevel"); icol.prop(item, "pyramid"); icol.prop(item, "twist"); icol.prop(item, "bend")
+                            elif item.curve_instance_type == 'MESH_UVSPHERE':
+                                icol.prop(item, "sphere_thickness"); icol.prop(item, "sphere_elongation"); icol.prop(item, "sphere_cut_angle")
+                            elif item.curve_instance_type == 'MESH_ICOSPHERE':
+                                icol.prop(item, "prism_sides"); icol.prop(item, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(item, "prism_pyramid"); icol.prop(item, "prism_bend"); icol.prop(item, "prism_twist")
+                            elif item.curve_instance_type == 'MESH_TORUS':
+                                icol.prop(item, "torus_outer_radius"); icol.prop(item, "torus_inner_radius"); icol.prop(item, "torus_thickness"); icol.prop(item, "torus_cut_angle"); icol.prop(item, "torus_elongation")
+                            elif item.curve_instance_type == 'MESH_CYLINDER':
+                                icol.prop(item, "cylinder_thickness"); icol.prop(item, "cylinder_roundness"); icol.prop(item, "cylinder_pyramid"); icol.prop(item, "cylinder_bend")
+                            elif item.curve_instance_type == 'MESH_CONE':
+                                icol.label(text="Cone radius is controlled by curve point radius (Alt+S).")
+                        else: # --- CUSTOM MODE UI ---
+                            custom_box = ccol.box()
+                            row = custom_box.row()
+                            row.template_list("SDF_UL_curve_points", "", item, "custom_control_points", item, "active_control_point_index")
+                            ops_col = row.column(align=True)
+                            ops_col.operator("prototyper.sdf_curve_point_add", icon='ADD', text="")
+                            ops_col.operator("prototyper.sdf_curve_point_remove", icon='REMOVE', text="")
+                            idx = item.active_control_point_index
+                            if 0 <= idx < len(item.custom_control_points):
+                                point = item.custom_control_points[idx]
+                                point_box = custom_box.box()
+                                pcol = point_box.column(align=True)
+                                pcol.prop(point, "t_value", text="Position")
+                                pcol.prop(point, "radius_multiplier", text="Radius")
+                                pcol.prop(point, "color")
+                                pcol.prop(point, "shape_type", text="Shape")
+                                pcol.prop(point, "rotation")
+                                inst_box = point_box.box()
+                                inst_box.label(text=f"{point.shape_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
+                                icol = inst_box.column(align=True)
+                                if point.shape_type == 'MESH_CUBE':
+                                    icol.prop(point, "thickness"); icol.prop(point, "roundness"); icol.prop(point, "bevel"); icol.prop(point, "pyramid"); icol.prop(point, "twist"); icol.prop(point, "bend")
+                                elif point.shape_type == 'MESH_UVSPHERE':
+                                    icol.prop(point, "sphere_thickness"); icol.prop(point, "sphere_elongation"); icol.prop(point, "sphere_cut_angle")
+                                elif point.shape_type == 'MESH_ICOSPHERE':
+                                    icol.prop(point, "prism_sides"); icol.prop(point, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(point, "prism_pyramid"); icol.prop(point, "prism_bend"); icol.prop(point, "prism_twist")
+                                elif point.shape_type == 'MESH_TORUS':
+                                    icol.prop(point, "torus_outer_radius"); icol.prop(point, "torus_inner_radius"); icol.prop(point, "torus_thickness"); icol.prop(point, "torus_cut_angle"); icol.prop(point, "torus_elongation")
+                                elif point.shape_type == 'MESH_CYLINDER':
+                                    icol.prop(point, "cylinder_thickness"); icol.prop(point, "cylinder_roundness"); icol.prop(point, "cylinder_pyramid"); icol.prop(point, "cylinder_bend")
+                        radius_box = curve_box.box()
+                        radius_box.label(text="Global Radius & Scale", icon='PROP_CON')
+                        rcol = radius_box.column(align=True)
+                        rcol.prop(item, "curve_global_radius")
+                        rcol.prop(item, "curve_segment_scale") 
+                        rcol.separator()
+                        rcol.prop(item, "curve_taper_head")
+                        rcol.prop(item, "curve_taper_tail")
+                        info_box = curve_box.box()
+                        info_box.label(text="To control per-point radius:", icon='INFO')
+                        info_box.label(text="1. Select the curve object.")
+                        info_box.label(text="2. Go into Edit Mode (Tab).")
+                        info_box.label(text="3. Select a point.")
+                        info_box.label(text="4. Press ALT+S to scale.")
                     sym = b.box()
                     sym.label(text="Symmetry", icon='MOD_MIRROR')
                     mr2 = sym.row(align=True)
@@ -1874,13 +2838,22 @@ class SDFPrototyperPanel(bpy.types.Panel):
             
         layout.separator()
         act_box = layout.box()
-        act_box.label(text="Finalize Mesh", icon='MOD_MESHDEFORM')
+        act_box.label(text="Finalize & Symmetrize", icon='MOD_MESHDEFORM')
         act_col = act_box.column(align=True)
         act_col.operator("object.convert_sdf", text="Convert to Mesh", icon='MESH_DATA')
         act_col.operator("object.sdf_bake_volume", text="Bake to High-Quality Mesh", icon='VOLUME_DATA')
+        
+        act_col.operator("object.sdf_bake_to_remesh", text="Bake for Remesh Object", icon='TEXTURE')
+
+        act_col.separator()
+        act_col.operator(OBJECT_OT_sdf_auto_uv.bl_idname, text="Auto UV Selected", icon='UV_DATA')
+        act_col.operator(OBJECT_OT_sdf_snap_selection_to_active.bl_idname, text="Snap Selection to Active", icon='SNAP_ON')
+
+
         act_col.separator()
         act_col.operator("prototyper.sdf_bake_symmetry", text="Bake Active Symmetries", icon='CHECKMARK')
-        
+        act_col.operator("prototyper.sdf_symmetrize", text="Symmetrize Model", icon='MOD_MIRROR')
+        act_col.operator("prototyper.sdf_flip_model", text="Flip Model...", icon='CON_ACTION')
         layout.separator()
         brush_box = layout.box()
         brush_box.label(text="Brush-Cube Clipping", icon='CUBE')
@@ -1893,10 +2866,8 @@ class SDFPrototyperPanel(bpy.types.Panel):
             brush_box.operator("object.delete_brush_cube", text="Delete Brush Cube", icon='TRASH')
         else:
             brush_box.operator("object.create_brush_cube", text="Create Brush Cube")
-
         layout.separator()
         layout.prop(scene, "sdf_render_panel_enable", text="Show Render Options", toggle=True, icon='RENDER_STILL')
-
 
 
 # -------------------------------------------------------------------
@@ -1981,67 +2952,75 @@ class StartSDFOperator(bpy.types.Operator):
     bl_label = "Start a New SDF Setup"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # ... (the invoke and draw methods remain the same) ...
-
     def execute(self, context):
-            # --- 1. CRITICAL: Ensure all assets are loaded ONCE. ---
-            try:
-                load_all_sdf_node_groups()
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to load SDF resources: {e}")
-                return {'CANCELLED'}
+        # --- 1. CRITICAL: Ensure all assets are loaded ONCE. ---
+        try:
+            load_all_sdf_node_groups()
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load SDF resources: {e}")
+            return {'CANCELLED'}
 
-            # 2. Cleanly remove any existing SDF domain to prevent conflicts.
+        # 2. Cleanly remove any existing SDF domain to prevent conflicts.
+        if context.scene.sdf_domain:
+            bpy.ops.prototyper.sdf_clear('INVOKE_DEFAULT')
             if context.scene.sdf_domain:
-                # We must use the clear operator to be safe
-                bpy.ops.prototyper.sdf_clear('INVOKE_DEFAULT')
-                # Check again in case the user cancelled
-                if context.scene.sdf_domain:
-                    bpy.data.objects.remove(context.scene.sdf_domain, do_unlink=True)
-                context.scene.sdf_domain = None
-
-            # 3. Create the new SDF Domain object
-            bpy.ops.mesh.primitive_cube_add(size=1, enter_editmode=False, align='WORLD', location=(0, 0, 0))
-            domain_obj = context.active_object
-            domain_obj.name = "SDF_Domain"
-            context.scene.sdf_domain = domain_obj
-
-            # 4. Add and configure the Geometry Nodes modifier
-            geo_mod = domain_obj.modifiers.new(name="SDF Nodes", type='NODES')
-            if not geo_mod.node_group:
-                geo_mod.node_group = bpy.data.node_groups.new(name="SDF Node Tree", type='GeometryNodeTree')
-            node_tree = geo_mod.node_group
-            node_tree.nodes.clear()
-
-            # 5. Create the essential nodes for the base setup
-            group_output = node_tree.nodes.new(type="NodeGroupOutput")
-            group_output.location = (400, 0)
-            
-            domain_node_group = bpy.data.node_groups.get("SDF Domain")
-            if not domain_node_group:
-                self.report({'ERROR'}, "FATAL: Could not find 'SDF Domain' node group after loading assets.")
-                bpy.data.objects.remove(domain_obj, do_unlink=True)
+                self.report({'WARNING'}, "Previous SDF domain was not cleared. Aborting generation.")
                 return {'CANCELLED'}
-                
-            sdf_domain_node = node_tree.nodes.new(type="GeometryNodeGroup")
-            sdf_domain_node.node_tree = domain_node_group
-            sdf_domain_node.location = (0, 0)
-            sdf_domain_node.name = "SDF Domain"
+            context.scene.sdf_domain = None
 
-            # 6. Wire the initial chain, lock the panel, and set initial resolution
-            rewire_full_sdf_chain(context)
-            context.scene.lock_sdf_panel = True
-            update_sdf_resolution(self, context)
-            # The line 'start_sdf_monitor()' has been removed from here.
+        # 3. Create the new SDF Domain object.
+        bpy.ops.mesh.primitive_cube_add(size=1, enter_editmode=False, align='WORLD', location=(0, 0, 0))
+        domain_obj = context.active_object
+        domain_obj.name = "SDF_Domain"
+        context.scene.sdf_domain = domain_obj
 
-            self.report({'INFO'}, "New Rogue SDF AI system initialized successfully.")
-            return {'FINISHED'}
+        # 4. Add and configure the Geometry Nodes modifier.
+        geo_mod = domain_obj.modifiers.new(name="SDF Nodes", type='NODES')
+        if not geo_mod.node_group:
+            geo_mod.node_group = bpy.data.node_groups.new(name="SDF Node Tree", type='GeometryNodeTree')
+        node_tree = geo_mod.node_group
+        node_tree.nodes.clear()
 
+        # --- 5. Create ALL essential, permanent nodes for the base setup. ---
+        group_output = node_tree.nodes.new(type="NodeGroupOutput")
+        group_output.location = (600, 0)
+        
+        # Create SDF Domain Node
+        domain_node_group = bpy.data.node_groups.get("SDF Domain")
+        if not domain_node_group:
+            self.report({'ERROR'}, "FATAL: Could not find 'SDF Domain' node group.")
+            bpy.data.objects.remove(domain_obj, do_unlink=True)
+            return {'CANCELLED'}
+        sdf_domain_node = node_tree.nodes.new(type="GeometryNodeGroup")
+        sdf_domain_node.node_tree = domain_node_group
+        sdf_domain_node.location = (200, 0)
+        sdf_domain_node.name = "SDF Domain"
+
+        # --- FIX: Create the SDF Points Output node right at the start ---
+        points_node_group = bpy.data.node_groups.get("SDF Points Output")
+        if not points_node_group:
+            self.report({'ERROR'}, "FATAL: Could not find 'SDF Points Output' node group.")
+            bpy.data.objects.remove(domain_obj, do_unlink=True)
+            return {'CANCELLED'}
+        points_output_node = node_tree.nodes.new(type="GeometryNodeGroup")
+        points_output_node.node_tree = points_node_group
+        points_output_node.location = (400, -150)
+        points_output_node.name = "SDF Points Output"
+        # --- END FIX ---
+
+        # 6. Wire the initial chain, lock the panel, and set initial values.
+        rewire_full_sdf_chain(context)
+        context.scene.lock_sdf_panel = True
+        context.scene.sdf_domain_scale = 1.0 
+        update_sdf_resolution(self, context)
+
+        self.report({'INFO'}, "New Rogue SDF AI system initialized successfully.")
+        return {'FINISHED'}
 #---------------------------------------------------------------------
 
 
 class ConvertSDFOperator(bpy.types.Operator):
-    """Convert SDF to a new, separate Mesh object"""
+    """Convert SDF to a new, separate Mesh object, always using solid geometry"""
     bl_idname = "object.convert_sdf"
     bl_label = "Convert SDF to Mesh"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2052,19 +3031,17 @@ class ConvertSDFOperator(bpy.types.Operator):
 
     def execute(self, context):
         domain_obj = context.scene.sdf_domain
-
-        # 1. Deselect everything and select the domain object
+        
+        # The logic for saving/restoring point cloud state has been REMOVED
+        
         bpy.ops.object.select_all(action='DESELECT')
         context.view_layer.objects.active = domain_obj
         domain_obj.select_set(True)
 
-        # 2. Duplicate the domain object. The new object will be active.
         bpy.ops.object.duplicate()
         new_mesh_obj = context.active_object
         new_mesh_obj.name = "Converted_SDF_Mesh"
 
-        # 3. Apply the Geometry Nodes modifier ON THE DUPLICATE
-        # We find the modifier by type, which is more robust than by name
         mod_to_apply = next((m for m in new_mesh_obj.modifiers if m.type == 'NODES'), None)
         if mod_to_apply:
             bpy.ops.object.modifier_apply(modifier=mod_to_apply.name)
@@ -2072,134 +3049,152 @@ class ConvertSDFOperator(bpy.types.Operator):
             self.report({'WARNING'}, "No Geometry Nodes modifier found to apply.")
             return {'CANCELLED'}
         
-        # 4. Clean up the converted mesh (remove custom properties)
-        if 'sdf_nodes' in new_mesh_obj:
-            del new_mesh_obj['sdf_nodes']
-        if 'active_sdf_node_index' in new_mesh_obj:
-            del new_mesh_obj['active_sdf_node_index']
+        if 'sdf_nodes' in new_mesh_obj: del new_mesh_obj['sdf_nodes']
+        if 'active_sdf_node_index' in new_mesh_obj: del new_mesh_obj['active_sdf_node_index']
 
         self.report({'INFO'}, f"Successfully converted SDF to new mesh: '{new_mesh_obj.name}'")
         return {'FINISHED'}
     
 #---------------------------------------------------------------------
 
-import bpy, math
-from mathutils import Vector
+import bpy
+import math
+from mathutils import Vector, Matrix
 
-# In main.py, replace the entire OBJECT_OT_bake_sdf_symmetry class with this one.
+class PROTOTYPER_OT_SDFSymmetrize(bpy.types.Operator):
+    """Deletes all shapes on one side and replaces them with a mirrored copy of the other side."""
+    bl_idname = "prototyper.sdf_symmetrize"
+    bl_label = "Symmetrize SDF Model"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    axis: bpy.props.EnumProperty(
+        name="Axis",
+        items=[('X', "X", "Symmetrize along the X-axis"),
+               ('Y', "Y", "Symmetrize along the Y-axis"),
+               ('Z', "Z", "Symmetrize along the Z-axis")],
+        default='X'
+    )
+
+    direction: bpy.props.EnumProperty(
+        name="Direction",
+        items=[('POSITIVE_TO_NEGATIVE', "+ to -", "Copy the positive side to the negative side"),
+               ('NEGATIVE_TO_POSITIVE', "- to +", "Copy the negative side to the positive side")],
+        default='POSITIVE_TO_NEGATIVE'
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.sdf_domain is not None and hasattr(context.scene.sdf_domain, 'sdf_nodes')
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        node_tree = get_sdf_geometry_node_tree(context)
+        if not node_tree:
+            self.report({'ERROR'}, "SDF Node Tree not found.")
+            return {'CANCELLED'}
+
+        # --- Setup ---
+        axis_index = {'X': 0, 'Y': 1, 'Z': 2}[self.axis]
+        sign = 1.0 if self.direction == 'POSITIVE_TO_NEGATIVE' else -1.0
+        center_coord = domain.location[axis_index]
+
+        items_to_delete_indices = []
+        objects_to_delete = []
+        copy_templates = []
+
+        # --- 1. Classification Phase (Now with robustness check) ---
+        for i, item in enumerate(domain.sdf_nodes):
+            # ROBUSTNESS FIX: Skip any broken items in the list to prevent crashes.
+            if not item.empty_object:
+                print(f"[Rogue SDF AI] Symmetrize Warning: Skipping invalid item '{item.name}' in list.")
+                continue
+
+            loc = item.empty_object.location[axis_index]
+            dist = (loc - center_coord) * sign
+
+            if dist > 1e-6:  # This is on the source side, so we will copy it.
+                copy_templates.append(item)
+            elif dist < -1e-6:  # This is on the destination side, so it must be deleted.
+                items_to_delete_indices.append(i)
+                objects_to_delete.append(item.empty_object)
+            # else: the object is on the center plane and is left untouched.
+
+        # --- 2. Deletion Phase ---
+        # First, remove the UI list items, going backwards to preserve indices.
+        for index in sorted(items_to_delete_indices, reverse=True):
+            domain.sdf_nodes.remove(index)
+            
+        # Then, delete the associated nodes and Blender objects.
+        for empty in objects_to_delete:
+            node = next((n for n in node_tree.nodes if n.get("associated_empty") == empty.name), None)
+            if node:
+                node_tree.nodes.remove(node)
+            
+            # Delete all children (like Cone tips or Curve objects) first.
+            for child in list(empty.children):
+                bpy.data.objects.remove(child, do_unlink=True)
+            
+            # Finally, delete the main empty controller.
+            bpy.data.objects.remove(empty, do_unlink=True)
+
+        # --- 3. Creation Phase (Using the new corrected helper) ---
+        for template_item in copy_templates:
+            # ROBUSTNESS FIX: A final check to ensure the template is still valid before using it.
+            if not template_item.empty_object:
+                print(f"[Rogue SDF AI] Symmetrize Warning: Skipping invalid template item '{template_item.name}' during creation.")
+                continue
+
+            # Find the geometry node associated with our valid template item.
+            template_node = next((n for n in node_tree.nodes if n.get("associated_empty") == template_item.empty_object.name), None)
+            
+            if template_node:
+                # This single call now handles all the complex mirroring logic correctly.
+                _mirror_and_clone_shape(context, template_item, template_node, self.axis)
+            else:
+                print(f"[Rogue SDF AI] Symmetrize Warning: Could not find node for template '{template_item.name}'.")
+
+        # --- 4. Finalization ---
+        rewire_full_sdf_chain(context)
+        self.report({'INFO'}, f"Symmetrized model across {self.axis}-axis.")
+        return {'FINISHED'}
+
+def is_mirror_matrix(matrix: Matrix) -> bool:
+    """Returns True if matrix has negative determinant (a reflection)"""
+    return matrix.determinant() < 0
+
+
+
+import bpy, math
+from mathutils import Vector, Matrix
 
 class OBJECT_OT_bake_sdf_symmetry(bpy.types.Operator):
-    """Convert mirror/radial flags into real, separate SDF shapes"""
+    """
+    Bakes symmetry by creating true clones of the source shape,
+    each inheriting all deformer properties and a stable transform.
+    """
     bl_idname = "prototyper.sdf_bake_symmetry"
-    bl_label  = "Bake Active Symmetries"
+    bl_label = "Bake Active Symmetries"
     bl_options= {'REGISTER','UNDO'}
 
     @classmethod
     def poll(cls, context):
-        # The button will only be greyed out if no shape is selected.
         domain = context.scene.sdf_domain
-        if not (domain and hasattr(domain, 'sdf_nodes')):
-            return False
-        return 0 <= domain.active_sdf_node_index < len(domain.sdf_nodes)
-
-    def _create_baked_shape(self, context, source_item, source_node, transform_matrix):
-        """Helper function to create a single new SDF shape instance."""
-        domain_obj = context.scene.sdf_domain
-        node_tree = get_sdf_geometry_node_tree(context)
-        source_empty = source_item.empty_object
-
-        # --- Create New Node ---
-        new_node = node_tree.nodes.new(type=source_node.bl_idname)
-        if new_node.bl_idname == 'GeometryNodeGroup':
-            new_node.node_tree = source_node.node_tree
-        new_node.location = source_node.location + Vector((0, -200 * (len(domain_obj.sdf_nodes) + 1)))
-        for i, orig_input in enumerate(source_node.inputs):
-            if hasattr(orig_input, "default_value"):
-                new_node.inputs[i].default_value = orig_input.default_value
-
-        # --- Create New Empty & Apply Transform ---
-        new_empty = source_empty.copy()
-        if new_empty.data: new_empty.data = source_empty.data.copy()
-        context.collection.objects.link(new_empty)
-        new_empty.parent = domain_obj
-        new_empty.matrix_world = transform_matrix
-
-        # Normalize scale: mirror flips scale neg, but rotation should show mirrored geometry
-        scale = new_empty.scale
-        if scale.x < 0 or scale.y < 0 or scale.z < 0:
-            # Flip sign to be positive
-            scale = Vector((abs(scale.x), abs(scale.y), abs(scale.z)))
-            new_empty.scale = scale
-
-        
-        # --- Create New UI List Item ---
-        new_item = domain_obj.sdf_nodes.add()
-        new_empty.name = f"{source_item.name}.Sym"
-        new_item.name = new_empty.name
-        new_item.empty_object = new_empty
-        new_item.icon = source_item.icon
-        new_item.preview_color = source_item.preview_color
-
-        # --- Link everything ---
-        new_node["associated_empty"] = new_empty.name
-        
-        # --- Link the new empty/objects to the geometry node input ---
-        if source_item.icon == 'MESH_CONE':
-            source_tip = next((child for child in source_empty.children if "Tip" in child.name), None)
-            if source_tip:
-                new_tip = source_tip.copy()
-                if new_tip.data:
-                    new_tip.data = source_tip.data.copy()
-                context.collection.objects.link(new_tip)
-                new_tip.parent = new_empty
-
-                # Transform tip to match mirror
-                new_tip.matrix_world = transform_matrix @ source_empty.matrix_world.inverted() @ source_tip.matrix_world
-
-                # Optional mirror correction block
-                if is_mirror_matrix(transform_matrix):
-                    fix_scale_and_direction(new_empty, new_tip)
-
-                # 🔧 FIX: Recalculate cone direction
-                base_pos = new_empty.matrix_world.to_translation()
-                tip_pos = new_tip.matrix_world.to_translation()
-                direction = (tip_pos - base_pos).normalized()
-                if direction.length < 0.0001:
-                    direction = Vector((0, 1, 0))  # fallback
-                rot = direction.to_track_quat('Y', 'Z')
-                new_empty.rotation_mode = 'QUATERNION'
-                new_empty.rotation_quaternion = rot
-
-                # Assign base and tip to GN node
-                obj_inputs = [s for s in new_node.inputs if s.type == 'OBJECT']
-                if len(obj_inputs) >= 2:
-                    obj_inputs[0].default_value = new_empty
-                    obj_inputs[1].default_value = new_tip
-
-        else:
-            # For standard shapes like cube, sphere, etc — link the main empty
-            for socket in new_node.inputs:
-                if socket.type == 'OBJECT':
-                    socket.default_value = new_empty
-                    break  # done
-            
-        return new_empty
+        if not (domain and hasattr(domain, 'sdf_nodes')): return False
+        idx = domain.active_sdf_node_index
+        if not (0 <= idx < len(domain.sdf_nodes)): return False
+        item = domain.sdf_nodes[idx]
+        return item.use_mirror_x or item.use_mirror_y or item.use_mirror_z or \
+               (item.use_radial_mirror and item.radial_mirror_count > 1)
 
     def execute(self, context):
         domain = context.scene.sdf_domain
-        idx = domain.active_sdf_node_index
-        source_item = domain.sdf_nodes[idx]
-
-        # --- NEW LOGIC: Check for symmetry inside the operator ---
-        has_symmetry = source_item.use_mirror_x or source_item.use_mirror_y or source_item.use_mirror_z or \
-                      (source_item.use_radial_mirror and source_item.radial_mirror_count > 1)
-        
-        if not has_symmetry:
-            self.report({'WARNING'}, "Enable Mirror or Radial Symmetry on the selected shape first.")
-            return {'CANCELLED'}
-        # --- END OF NEW LOGIC ---
-
+        active_index = domain.active_sdf_node_index
+        source_item = domain.sdf_nodes[active_index]
         source_empty = source_item.empty_object
+
         node_tree = get_sdf_geometry_node_tree(context)
         source_node = next((n for n in node_tree.nodes if n.get("associated_empty") == source_empty.name), None)
 
@@ -2207,74 +3202,37 @@ class OBJECT_OT_bake_sdf_symmetry(bpy.types.Operator):
             self.report({'ERROR'}, "Source shape is not valid.")
             return {'CANCELLED'}
 
-        # --- Baking logic ---
-        # Store original matrix to avoid duplicating the source shape
-        original_matrix = source_empty.matrix_world.copy()
-        
-        # Start with a list of matrices to process, beginning with the original
-        matrices_to_process = [original_matrix]
-        
-        # Store the final list of all generated matrices (including original)
-        final_matrices = [original_matrix]
-
-        pivot_matrix = Matrix.Translation(domain.location)
-        pivot_matrix_inv = pivot_matrix.inverted()
-
-        # --- Radial Symmetry ---
+        # --- Create Radial Clones (Rotation doesn't cause flipping) ---
         if source_item.use_radial_mirror and source_item.radial_mirror_count > 1:
             count = source_item.radial_mirror_count
             angle_step = (2 * math.pi) / count
-            new_radial_matrices = []
+            pivot_matrix = Matrix.Translation(domain.location)
+            pivot_matrix_inv = pivot_matrix.inverted()
+            
             for i in range(1, count):
+                new_sdf = _clone_sdf_hierarchy(context, source_item, source_node, new_name_suffix=f".Radial.{i}")
                 rot_matrix = Matrix.Rotation(angle_step * i, 4, 'Z')
-                transform = pivot_matrix @ rot_matrix @ pivot_matrix_inv
-                new_matrix = transform @ original_matrix
-                new_radial_matrices.append(new_matrix)
-            matrices_to_process.extend(new_radial_matrices)
-            final_matrices.extend(new_radial_matrices)
-        
-        # --- Planar Mirror ---
-        mirror_axes = []
-        if source_item.use_mirror_x: mirror_axes.append(Vector((1, 0, 0)))
-        if source_item.use_mirror_y: mirror_axes.append(Vector((0, 1, 0)))
-        if source_item.use_mirror_z: mirror_axes.append(Vector((0, 0, 1)))
+                # Apply rotation around the domain's center
+                new_sdf["empty"].matrix_world = pivot_matrix @ rot_matrix @ pivot_matrix_inv @ source_empty.matrix_world
 
-        if mirror_axes:
-            current_matrices_to_mirror = list(final_matrices) # Mirror all existing shapes
-            for axis_vector in mirror_axes:
-                scale_matrix = Matrix.Scale(-1, 4, axis_vector)
-                transform = pivot_matrix @ scale_matrix @ pivot_matrix_inv
-                for mat in current_matrices_to_mirror:
-                    final_matrices.append(transform @ mat)
+        # --- Create Mirrored Clones (using the new robust function) ---
+        if source_item.use_mirror_x:
+            _mirror_and_clone_shape(context, source_item, source_node, 'X')
+        if source_item.use_mirror_y:
+            _mirror_and_clone_shape(context, source_item, source_node, 'Y')
+        if source_item.use_mirror_z:
+            _mirror_and_clone_shape(context, source_item, source_node, 'Z')
 
-        # --- Utility: Test if two matrices are equal (with tolerance) ---
-        def matrices_equal(mat_a, mat_b, tol=1e-6):
-            for i in range(4):
-                for j in range(4):
-                    if abs(mat_a[i][j] - mat_b[i][j]) > tol:
-                        return False
-            return True
-
-        # --- Create all the new objects, excluding the original ---
-        num_created = 0
-        for matrix in final_matrices:
-            if matrices_equal(matrix, original_matrix):
-                continue
-            self._create_baked_shape(context, source_item, source_node, matrix)
-            num_created += 1
-
-
+        # Disable mirror flags on the original shape after baking
         source_item.use_mirror_x = False
         source_item.use_mirror_y = False
         source_item.use_mirror_z = False
         source_item.use_radial_mirror = False
 
-        # Final cleanup
         rewire_full_sdf_chain(context)
-        self.report({'INFO'}, f"Baked {num_created} new shapes from symmetry.")
-        
-        self.report({'INFO'}, f"Baked {num_created} new shapes from symmetry.")
+        self.report({'INFO'}, "Baked symmetries into new independent shapes.")
         return {'FINISHED'}
+
     
 #--------------------------------------------------------------------
 
@@ -2309,7 +3267,7 @@ from mathutils import Vector
 # Find this class in your main.py file and replace it completely.
 
 class SDFDuplicateOperator(bpy.types.Operator):
-    """Duplicate the selected SDF node and its associated empty(s), then rebuild the entire chain."""
+    """Duplicates the selected SDF shape and its entire hierarchy (works for all types)."""
     bl_idname = "prototyper.sdf_duplicate"
     bl_label = "Duplicate Selected SDF Node"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2321,76 +3279,26 @@ class SDFDuplicateOperator(bpy.types.Operator):
         active_index = domain_obj.active_sdf_node_index
         if not (0 <= active_index < len(domain_obj.sdf_nodes)): return {'CANCELLED'}
 
-        original_item = domain_obj.sdf_nodes[active_index]
-        original_empty = original_item.empty_object
-        if not original_empty: return {'CANCELLED'}
+        source_item = domain_obj.sdf_nodes[active_index]
+        if not source_item.empty_object: return {'CANCELLED'}
             
         node_tree = get_sdf_geometry_node_tree(context)
         if not node_tree: return {'CANCELLED'}
         
-        original_node = next((n for n in node_tree.nodes if n.get('associated_empty') == original_empty.name), None)
-        if not original_node: return {'CANCELLED'}
+        source_node = next((n for n in node_tree.nodes if n.get('associated_empty') == source_item.empty_object.name), None)
+        if not source_node: return {'CANCELLED'}
 
-        # --- Create New Node ---
-        new_node = node_tree.nodes.new(type=original_node.bl_idname)
-        if new_node.bl_idname == 'GeometryNodeGroup':
-            new_node.node_tree = original_node.node_tree
-        new_node.location = original_node.location + Vector((0, -200))
-        for i, orig_input in enumerate(original_node.inputs):
-            if hasattr(orig_input, "default_value"):
-                new_node.inputs[i].default_value = orig_input.default_value
-
-        # --- Create New Empty Controller ---
-        new_empty = original_empty.copy()
-        if new_empty.data:
-            new_empty.data = original_empty.data.copy()
-        context.collection.objects.link(new_empty)
-        new_empty.parent = original_empty.parent
-
-        # --- Create New UI List Item ---
-        new_item = domain_obj.sdf_nodes.add()
-        new_empty.name = f"{original_item.name}.Dupe"
-        new_item.name = new_empty.name
-        new_item.empty_object = new_empty
-        new_item.icon = original_item.icon
+        # Use the new robust cloning function
+        new_sdf = _clone_sdf_hierarchy(context, source_item, source_node, new_name_suffix=".Dupe")
         
-        # --- THIS IS THE NEW LINE ---
-        new_item.preview_color = original_item.preview_color
-        # --- END OF NEW LINE ---
-
-        # --- CONE-AWARE LOGIC ---
-        new_node["associated_empty"] = new_empty.name
-
-        if original_item.icon == 'MESH_CONE':
-            original_tip = next((child for child in original_empty.children if "Tip" in child.name), None)
-            if original_tip:
-                new_tip = original_tip.copy()
-                if new_tip.data:
-                    new_tip.data = original_tip.data.copy()
-                context.collection.objects.link(new_tip)
-                new_tip.parent = new_empty
-                
-                obj_inputs = [sock for sock in new_node.inputs if sock.type == 'OBJECT']
-                if len(obj_inputs) >= 2:
-                    obj_inputs[0].default_value = new_empty
-                    obj_inputs[1].default_value = new_tip
-                else:
-                    self.report({'WARNING'}, "Cone node is missing its object inputs.")
-            else:
-                self.report({'WARNING'}, "Could not find Tip empty for cone duplication.")
-        else:
-            obj_input_socket = next((sock for sock in new_node.inputs if sock.type == 'OBJECT'), None)
-            if obj_input_socket:
-                obj_input_socket.default_value = new_empty
-        
-        # --- Finalize ---
+        # Finalize
         domain_obj.sdf_nodes.move(len(domain_obj.sdf_nodes) - 1, active_index + 1)
         domain_obj.active_sdf_node_index = active_index + 1
         rewire_full_sdf_chain(context)
         
         bpy.ops.object.select_all(action='DESELECT')
-        new_empty.select_set(True)
-        context.view_layer.objects.active = new_empty
+        new_sdf["empty"].select_set(True)
+        context.view_layer.objects.active = new_sdf["empty"]
 
         return {'FINISHED'}
     
@@ -2419,220 +3327,266 @@ class PROTOTYPER_OT_toggle_smooth(bpy.types.Operator):
 import math # Make sure this import is at the top of your script
 from mathutils import Euler, Vector
 
+# In main.py, replace the entire PROTOTYPER_OT_SDFRepeatShape class with this one.
+
 class PROTOTYPER_OT_SDFRepeatShape(bpy.types.Operator):
-    """Create multiple copies of the selected SDF shape that are fully compatible with Global Scale"""
+    """Create multiple copies of the selected SDF shape using Linear or Radial methods."""
     bl_idname = "prototyper.sdf_repeat_shape"
     bl_label = "Repeat SDF Shape"
     bl_options = {'REGISTER', 'UNDO'}
 
-    count: bpy.props.IntProperty(
-        name="Count",
-        description="How many copies to create",
-        default=5,
-        min=1,
-        soft_max=100,
+    # --- Mode Selection (Curve mode removed) ---
+    repeat_mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('LINEAR', "Linear", "Repeat in a straight line"),
+            ('RADIAL', "Radial", "Repeat in a circle around the 3D cursor")
+        ],
+        default='LINEAR'
     )
-    
-    direction: bpy.props.FloatVectorProperty(
-        name="Direction",
-        description="The axis and direction of repetition (e.g., (1,0,0) for X-axis)",
-        default=(1.0, 0.0, 0.0)
-    )
-    
-    spacing: bpy.props.FloatProperty(
-        name="Spacing",
-        description="The distance between each repeated shape",
-        default=1.0,
-        min=0.0,
-        soft_max=10.0,
-        unit='LENGTH'
+
+    # --- Linear Properties ---
+    linear_count: bpy.props.IntProperty(name="Count", default=5, min=1, soft_max=100)
+    linear_direction: bpy.props.FloatVectorProperty(name="Direction", default=(1.0, 0.0, 0.0))
+    linear_spacing: bpy.props.FloatProperty(name="Spacing", default=1.0, min=0.0, soft_max=10.0, unit='LENGTH')
+
+    # --- Radial Properties (Mirror option removed) ---
+    radial_count: bpy.props.IntProperty(name="Count", default=8, min=2, soft_max=128)
+    radial_axis: bpy.props.EnumProperty(
+        name="Axis",
+        items=[('X', "X", ""), ('Y', "Y", ""), ('Z', "Z", "")],
+        default='Z'
     )
 
     @classmethod
     def poll(cls, context):
         domain = getattr(context.scene, "sdf_domain", None)
-        if not domain or not hasattr(domain, 'sdf_nodes'):
-            return False
+        if not domain or not hasattr(domain, 'sdf_nodes'): return False
         return 0 <= domain.active_sdf_node_index < len(domain.sdf_nodes)
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
 
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        
+        layout.prop(self, "repeat_mode", expand=True)
+        layout.separator()
+        
+        box = layout.box()
+        
+        if self.repeat_mode == 'LINEAR':
+            box.prop(self, "linear_count")
+            box.prop(self, "linear_direction")
+            box.prop(self, "linear_spacing")
+            
+        elif self.repeat_mode == 'RADIAL':
+            box.label(text="Uses 3D Cursor as Pivot", icon='CURSOR')
+            box.label(text="Radius is the distance from the 3D Cursor.")
+            box.prop(self, "radial_count")
+            box.prop(self, "radial_axis")
+
     def execute(self, context):
         domain_obj = context.scene.sdf_domain
         active_index = domain_obj.active_sdf_node_index
-
         original_item = domain_obj.sdf_nodes[active_index]
         original_empty = original_item.empty_object
-        if not original_empty:
-            self.report({'ERROR'}, "Source item has no valid Empty object.")
-            return {'CANCELLED'}
+        if not original_empty: return {'CANCELLED'}
         
         node_tree = get_sdf_geometry_node_tree(context)
-        if not node_tree:
-            self.report({'ERROR'}, "SDF Domain has no valid Geometry Node tree.")
-            return {'CANCELLED'}
-        
         original_node = next((n for n in node_tree.nodes if n.get("associated_empty") == original_empty.name), None)
-        if not original_node:
-            self.report({'ERROR'}, "Could not find the Geometry Node for the selected shape.")
-            return {'CANCELLED'}
-
-        direction_vec = Vector(self.direction)
-        final_offset = direction_vec.normalized() * self.spacing if direction_vec.length > 0 else Vector((0.0, 0.0, 0.0))
+        if not original_node: return {'CANCELLED'}
 
         bpy.ops.object.select_all(action='DESELECT')
         context.view_layer.objects.active = None
         
-        last_created_empty = None
+        created_empties = []
 
-        for i in range(self.count):
-            # --- Create New Node ---
-            new_node = node_tree.nodes.new(type=original_node.bl_idname)
-            if new_node.bl_idname == 'GeometryNodeGroup':
-                new_node.node_tree = original_node.node_tree
-            new_node.location = original_node.location + Vector((20 * (i+1), -200 * (i+1)))
-            for j, orig_input in enumerate(original_node.inputs):
-                if hasattr(orig_input, "default_value"):
-                    new_node.inputs[j].default_value = orig_input.default_value
+        # --- LINEAR MODE ---
+        if self.repeat_mode == 'LINEAR':
+            direction_vec = Vector(self.linear_direction)
+            final_offset = direction_vec.normalized() * self.linear_spacing if direction_vec.length > 0 else Vector()
+            for i in range(self.linear_count):
+                new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Repeat.{i+1}")
+                new_empty = new_sdf["empty"]
+                new_empty.location = original_empty.location + (final_offset * (i + 1))
+                created_empties.append(new_empty)
 
-            # --- Create and Position New Empty Controller ---
-            new_empty = original_empty.copy()
-            if new_empty.data:
-                new_empty.data = original_empty.data.copy()
-            context.collection.objects.link(new_empty)
+        # --- RADIAL MODE (Simplified) ---
+        elif self.repeat_mode == 'RADIAL':
+            pivot_point = context.scene.cursor.location
+            angle_step = (2 * math.pi) / self.radial_count
             
-            new_empty.parent = domain_obj
-            new_empty.location = original_empty.location + (final_offset * (i + 1))
-            new_empty.scale = original_empty.scale
-            new_empty.rotation_euler = original_empty.rotation_euler
+            pivot_mat = Matrix.Translation(pivot_point)
+            pivot_inv_mat = Matrix.Translation(-pivot_point)
 
-            # --- CRITICAL FIX for Global Scale ---
-            new_empty["initial_location"] = new_empty.location.copy()
-            new_empty["initial_scale"] = new_empty.scale.copy()
+            for i in range(1, self.radial_count):
+                new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Radial.{i}")
+                new_empty = new_sdf["empty"]
 
-            # --- Create New UI List Item ---
-            new_item = domain_obj.sdf_nodes.add()
-            new_empty.name = f"{original_item.name}.Repeat"
-            new_item.name = new_empty.name
-            new_item.empty_object = new_empty
-            new_item.icon = original_item.icon
-            new_item.is_hidden = original_item.is_hidden
-            new_item.is_viewport_hidden = original_item.is_viewport_hidden
-            
-            # --- THIS IS THE CRITICAL ADDITION ---
-            new_item.preview_color = original_item.preview_color
-            # --- END OF ADDITION ---
-            
-            # --- NEW CONE-AWARE LOGIC FOR REPEAT ---
-            new_node["associated_empty"] = new_empty.name
+                rot_mat = Matrix.Rotation(angle_step * i, 4, self.radial_axis)
+                
+                new_empty.matrix_world = pivot_mat @ rot_mat @ pivot_inv_mat @ original_empty.matrix_world
 
-            if original_item.icon == 'MESH_CONE':
-                original_tip = next((child for child in original_empty.children if "Tip" in child.name), None)
-                if original_tip:
-                    new_tip = original_tip.copy()
-                    if new_tip.data:
-                        new_tip.data = original_tip.data.copy()
-                    context.collection.objects.link(new_tip)
-                    new_tip.parent = new_empty
-                    obj_inputs = [sock for sock in new_node.inputs if sock.type == 'OBJECT']
-                    if len(obj_inputs) >= 2:
-                        obj_inputs[0].default_value = new_empty
-                        obj_inputs[1].default_value = new_tip
-                else:
-                    self.report({'WARNING'}, "Could not find Tip empty for cone repetition.")
-            else:
-                obj_input_socket = next((sock for sock in new_node.inputs if sock.type == 'OBJECT'), None)
-                if obj_input_socket:
-                    obj_input_socket.default_value = new_empty
-            
-            last_created_empty = new_empty
+                # --- Mirroring logic removed ---
 
-        # --- Finalize ---
+                created_empties.append(new_empty)
+
         rewire_full_sdf_chain(context)
         
-        if last_created_empty:
-            last_created_empty.select_set(True)
-            context.view_layer.objects.active = last_created_empty
+        if created_empties:
+            for empty in created_empties:
+                empty.select_set(True)
+            context.view_layer.objects.active = created_empties[-1]
 
-        self.report({'INFO'}, f"Created {self.count} repeated shapes.")
+        self.report({'INFO'}, f"Created {len(created_empties)} repeated shapes.")
         return {'FINISHED'}
     
+#--------------------------------------------------------------------    
+    
+import bpy
 
-from mathutils import Matrix # Make sure this is imported at the top of your script
-
-from mathutils import Matrix # Make sure this is imported at the top of your script
-
-class PROTOTYPER_OT_SDFFlipShape(bpy.types.Operator):
-    """Flips the selected SDF shape on a given WORLD axis using Blender's built-in mirror tool."""
-    bl_idname = "prototyper.sdf_flip_shape"
-    bl_label = "Flip SDF Shape"
+class PROTOTYPER_OT_SDFFlipActiveShape(bpy.types.Operator):
+    """Flips the single active SDF shape around its own origin."""
+    bl_idname = "prototyper.sdf_flip_active_shape"
+    bl_label = "Flip Active SDF Shape"
     bl_options = {'REGISTER', 'UNDO'}
 
     axis: bpy.props.EnumProperty(
         name="Axis",
-        items=[('X', "X-Axis", "Flip on the World X-axis"),
-               ('Y', "Y-Axis", "Flip on the World Y-axis"),
-               ('Z', "Z-Axis", "Flip on the World Z-axis")],
+        items=[('X', "X", "Flip on the Global X-axis"),
+               ('Y', "Y", "Flip on the Global Y-axis"),
+               ('Z', "Z", "Flip on the Global Z-axis")],
         default='X'
     )
 
     @classmethod
     def poll(cls, context):
-        domain = getattr(context.scene, "sdf_domain", None)
-        if not domain or not hasattr(domain, 'sdf_nodes'):
-            return False
-        active_index = domain.active_sdf_node_index
-        if 0 <= active_index < len(domain.sdf_nodes):
-            return domain.sdf_nodes[active_index].empty_object is not None
-        return False
+        domain = context.scene.sdf_domain
+        return domain and 0 <= domain.active_sdf_node_index < len(domain.sdf_nodes)
 
     def execute(self, context):
-        domain_obj = context.scene.sdf_domain
-        active_index = domain_obj.active_sdf_node_index
-        item = domain_obj.sdf_nodes[active_index]
-        empty = item.empty_object
-
-        if not empty:
+        domain = context.scene.sdf_domain
+        item = domain.sdf_nodes[domain.active_sdf_node_index]
+        active_empty = item.empty_object
+        if not active_empty:
             return {'CANCELLED'}
 
-        # --- NEW, ROBUST METHOD USING BLENDER'S CORE MIRROR OPERATOR ---
+        original_pivot_mode = context.scene.tool_settings.transform_pivot_point
+        original_active_object = context.view_layer.objects.active
+        original_selection = context.selected_objects[:]
 
-        # 1. Store the current selection state to restore it later.
-        active_object = context.view_layer.objects.active
-        selected_objects = context.selected_objects[:]
-
-        # 2. Prepare the scene for the operator: deselect everything and
-        #    make our target empty the only active and selected object.
         bpy.ops.object.select_all(action='DESELECT')
-        context.view_layer.objects.active = empty
-        empty.select_set(True)
+        active_empty.select_set(True)
+        context.view_layer.objects.active = active_empty
 
-        # 3. Set the pivot point to "Individual Origins" to ensure the
-        #    flip happens around the object's own center.
-        original_pivot = context.scene.tool_settings.transform_pivot_point
         context.scene.tool_settings.transform_pivot_point = 'INDIVIDUAL_ORIGINS'
 
-        # 4. Call Blender's built-in mirror operator with the correct axis.
         bpy.ops.transform.mirror(
             orient_type='GLOBAL',
             constraint_axis=(self.axis == 'X', self.axis == 'Y', self.axis == 'Z')
         )
 
-        # 5. Restore the original pivot point setting.
-        context.scene.tool_settings.transform_pivot_point = original_pivot
+        # Force scale components to be positive after flipping
+        active_empty.scale.x = abs(active_empty.scale.x)
+        active_empty.scale.y = abs(active_empty.scale.y)
+        active_empty.scale.z = abs(active_empty.scale.z)
 
-        # 6. Restore the original selection.
+        context.scene.tool_settings.transform_pivot_point = original_pivot_mode
         bpy.ops.object.select_all(action='DESELECT')
-        for obj in selected_objects:
-            # Make sure the object still exists before trying to select it
+
+        # Restore original selection
+        for obj in original_selection:
             if obj.name in context.view_layer.objects:
                 obj.select_set(True)
-        context.view_layer.objects.active = active_object
-            
-        self.report({'INFO'}, f"Flipped '{item.name}' on the World {self.axis}-axis.")
+        context.view_layer.objects.active = original_active_object
+
+        self.report({'INFO'}, f"Flipped '{item.name}' on the {self.axis}-axis.")
+        return {'FINISHED'}
+
+    
+#-------------------------------------------------------------------
+
+class PROTOTYPER_OT_SDFFlipModel(bpy.types.Operator):
+    """
+    Flips the orientation of selected or all SDF shapes in-place around a global axis.
+    """
+    bl_idname = "prototyper.sdf_flip_model"
+    bl_label = "Flip SDF Model"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    axis: bpy.props.EnumProperty(
+        name="Axis",
+        items=[('X', "Global X-Axis", "Flip the shape's orientation on the X-axis"),
+               ('Y', "Global Y-Axis", "Flip the shape's orientation on the Y-axis"),
+               ('Z', "Global Z-Axis", "Flip the shape's orientation on the Z-axis")],
+        default='X'
+    )
+
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        description="Choose which shapes to flip",
+        items=[('SELECTED', "Selected", "Flip all selected shapes"),
+               ('ALL', "All", "Flip the entire model")],
+        default='SELECTED'
+    )
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        return domain and len(domain.sdf_nodes) > 0
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        # 1. Store the user's original selection state to restore it later
+        original_active = context.view_layer.objects.active
+        original_selection = context.selected_objects[:]
+
+        # 2. Determine which objects to flip
+        domain = context.scene.sdf_domain
+        valid_empties = {item.empty_object for item in domain.sdf_nodes if item.empty_object}
+        objects_to_flip = []
+
+        if self.mode == 'SELECTED':
+            objects_to_flip = [obj for obj in context.selected_objects if obj in valid_empties]
+        else:  # ALL
+            objects_to_flip = list(valid_empties)
+
+        if not objects_to_flip:
+            self.report({'WARNING'}, f"No valid SDF shapes found for mode: {self.mode}")
+            return {'CANCELLED'}
+
+        # 3. Use bpy.ops for a robust, viewport-aware rotation on each object
+        for obj in objects_to_flip:
+            # Isolate the object for the operation to ensure we only rotate it
+            bpy.ops.object.select_all(action='DESELECT')
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+
+            # Perform the 180-degree rotation (flip) around the object's own origin.
+            # This is the guaranteed, correct way to do this.
+            bpy.ops.transform.rotate(
+                value=math.pi,  # 180 degrees in radians
+                orient_axis=self.axis,
+                orient_type='GLOBAL',
+                center_override=obj.location  # CRITICAL: This forces the flip to be in-place.
+            )
+
+        # 4. Restore the user's original selection for a seamless experience
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in original_selection:
+            # Check if the object still exists before trying to select it
+            if obj and obj.name in context.view_layer.objects:
+                obj.select_set(True)
+        context.view_layer.objects.active = original_active
+
+        self.report({'INFO'}, f"Flipped {self.mode.lower()} shapes on the {self.axis}-axis.")
         return {'FINISHED'}
     
+#-------------------------------------------------------------------      
 
 
 class SDFDeleteOperator(bpy.types.Operator):
@@ -2725,6 +3679,37 @@ class SDFMeshToSDF(bpy.types.Operator):
     def execute(self, context):
         # (Implementation as in original code)
         self.report({'INFO'}, "Converted Mesh to SDF (implementation per original code)")
+        return {'FINISHED'}
+
+# In main.py, add this new operator class
+
+class PROTOTYPER_OT_SDFSetPointCloudPreview(bpy.types.Operator):
+    """Set the global SDF visualization mode."""
+    bl_idname = "prototyper.sdf_set_point_cloud_preview"
+    bl_label = "Set SDF Visualization"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('SOLID', "All Solid", "Set all shapes to Solid Mesh mode"),
+            ('POINTS', "All Points", "Set all shapes to Point Cloud mode"),
+        ]
+    )
+
+    @classmethod
+    def poll(cls, context):
+        domain = getattr(context.scene, "sdf_domain", None)
+        return domain and hasattr(domain, 'sdf_nodes')
+
+    def execute(self, context):
+        if self.mode == 'SOLID':
+            context.scene.sdf_visualization_mode = 'SOLID'
+        else: # POINTS
+            context.scene.sdf_visualization_mode = 'POINTS'
+        
+        # The update function on the scene property will handle the rewiring.
+        self.report({'INFO'}, f"SDF Visualization set to: {self.mode}")
         return {'FINISHED'}
 
 
@@ -3071,15 +4056,16 @@ class SDFTorusAdd(bpy.types.Operator):
             self.report({'ERROR'}, "'SDF Torus' node group not found. Please regenerate the domain.")
             return {'CANCELLED'}
 
+        # Create the GeometryNodeGroup node
         sdf_node = geo_nodes.nodes.new(type="GeometryNodeGroup")
         sdf_node.node_tree = node_group
         sdf_node.name = node_group.name
         sdf_node.location = (NodePositionManager.increment_position(), 1000)
-        if "Major Radius" in sdf_node.inputs:
-            sdf_node.inputs["Major Radius"].default_value = 0.20
-        if "Minor Radius" in sdf_node.inputs:
-            sdf_node.inputs["Minor Radius"].default_value = 0.05
+        
+        # NOTE: We no longer set default radius on the node's inputs.
+        # The new properties on SDFNodeItem now control the shape's parameters.
 
+        # Create controller Empty
         domain = context.scene.sdf_domain
         bpy.ops.object.empty_add(type='CUBE', location=domain.location)
         empty = context.active_object
@@ -3087,16 +4073,19 @@ class SDFTorusAdd(bpy.types.Operator):
         empty.empty_display_size = 0.25
         empty.parent = domain
 
+        # Add to UI list
         item = domain.sdf_nodes.add()
         item.name = empty.name
         item.empty_object = empty
         item.icon = 'MESH_TORUS'
 
+        # Link the node <-> empty
         sdf_node['associated_empty'] = empty.name
         obj_input = next((s for s in sdf_node.inputs if s.type == 'OBJECT'), None)
         if obj_input:
             obj_input.default_value = empty
 
+        # Finalize
         rewire_full_sdf_chain(context)
         bpy.ops.object.select_all(action='DESELECT')
         empty.select_set(True)
@@ -3564,71 +4553,244 @@ def update_sdf_node_name(self, context): pass
 def update_sdf_viewport_visibility(self, context): pass
 def check_mute_nodes(scene): pass
 def _redraw_shader_view(self, context): pass
+def update_point_cloud_preview(self, context): pass
+
+
+class SDFCurveControlPoint(PropertyGroup):
+    """Properties for a single user-defined control point on an SDF Curve."""
+    
+    # --- Core Control Properties ---
+    t_value: FloatProperty(name="Position (t)", description="Position of this control point along the curve (0=start, 1=end)", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    radius_multiplier: FloatProperty(name="Radius", description="Multiplier for the radius at this point", default=1.0, min=0.0, soft_max=5.0, subtype='FACTOR', update=_redraw_shader_view)
+    color: FloatVectorProperty(name="Color", subtype='COLOR', default=(1.0, 1.0, 1.0), min=0.0, max=1.0, update=_redraw_shader_view)
+    shape_type: EnumProperty(name="Shape", items=[('MESH_UVSPHERE', "Sphere", ""), ('MESH_CUBE', "Cube", ""), ('MESH_ICOSPHERE', "Prism", ""), ('CAPSULE', "Capsule", ""), ('MESH_TORUS', "Torus", ""), ('MESH_CYLINDER', "Cylinder", ""), ('MESH_CONE', "Cone", "")], default='MESH_UVSPHERE', update=_redraw_shader_view)
+    
+    # --- NEW: Per-Point Rotation ---
+    rotation: FloatVectorProperty(name="Rotation", description="Local rotation for the shape at this point", subtype='EULER', default=(0.0, 0.0, 0.0), update=_redraw_shader_view)
+
+    # --- NEW: All Advanced Parameters ---
+    # CUBE
+    thickness: FloatProperty(name="Thickness", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    roundness: FloatProperty(name="Roundness", default=0.0, min=0.0, soft_max=1, update=_redraw_shader_view)
+    bevel: FloatProperty(name="Bevel", default=0.0, min=0.0, soft_max=0.5, update=_redraw_shader_view)
+    pyramid: FloatProperty(name="Pyramid", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    twist: FloatProperty(name="Twist", default=0.0, min=-20.0, max=20.0, update=_redraw_shader_view)
+    bend: FloatProperty(name="Bend", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    
+    # SPHERE
+    sphere_thickness: FloatProperty(name="Thickness", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    sphere_elongation: FloatProperty(name="Elongation", default=0.0, min=0.0, soft_max=2.0, update=_redraw_shader_view)
+    sphere_cut_angle: FloatProperty(name="Pac-man", default=math.tau, min=0.0, max=math.tau, subtype='ANGLE', update=_redraw_shader_view)
+
+    # CYLINDER
+    cylinder_thickness: FloatProperty(name="Thickness", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    cylinder_roundness: FloatProperty(name="Roundness", default=0.0, min=0.0, soft_max=4.0, update=_redraw_shader_view)
+    cylinder_bend: FloatProperty(name="Bend", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    cylinder_pyramid: FloatProperty(name="Pyramid", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+
+    # PRISM
+    prism_sides: IntProperty(name="Sides", default=6, min=3, max=16, update=_redraw_shader_view)
+    prism_thickness: FloatProperty(name="Thickness", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    prism_bend: FloatProperty(name="Bend", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    prism_twist: FloatProperty(name="Twist", default=0.0, min=-20.0, max=20.0, update=_redraw_shader_view)
+    prism_pyramid: FloatProperty(name="Pyramid", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+
+    # TORUS
+    torus_outer_radius: FloatProperty(name="Outer Radius", default=0.4, min=0.01, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
+    torus_inner_radius: FloatProperty(name="Inner Radius", default=0.2, min=0.0, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
+    torus_thickness: FloatProperty(name="Thickness", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    torus_cut_angle: FloatProperty(name="Pac-man", default=math.tau, min=0.0, max=math.tau, subtype='ANGLE', update=_redraw_shader_view)
+    torus_elongation: FloatProperty(name="Elongation", default=0.0, min=0.0, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
 
 
 class SDFNodeItem(PropertyGroup):
-    name: StringProperty(
-        name="Node Name",
-        description="Rename this SDF shape",
-        update=update_sdf_node_name
-    )
-    empty_object: PointerProperty(
-        name="Controller Empty",
-        type=bpy.types.Object,
-        description="The Empty that drives this shape"
-    )
-    icon: EnumProperty(
-        name="Icon",
-        items=[
-            ('MESH_CUBE',    "Cube",     ""),
-            ('MESH_CYLINDER',"Cylinder", ""),
-            ('MESH_UVSPHERE',"Sphere",   ""),
-            ('MESH_CONE',    "Cone",     ""),
-            ('MESH_ICOSPHERE',"Prism",   ""),
-            ('MESH_TORUS',   "Torus",    ""),
-            ('CURVE_BEZCURVE',"Curve",   ""),
-            ('MESH_MONKEY',  "Mesh",     ""),
-            ('SCULPTMODE_HLT',"Sculpt",  ""),
-        ],
-        default='MESH_CUBE'
-    )
-    is_hidden: BoolProperty(name="Mute Shape", default=False, update=lambda self,ctx: check_mute_nodes(ctx.scene))
-    is_viewport_hidden: BoolProperty(name="Hide Empty", default=False, update=update_sdf_viewport_visibility)
+    # --- CORE PROPERTIES ---
+    name: StringProperty(name="Node Name", description="Rename this SDF shape", update=update_sdf_node_name)
+    empty_object: PointerProperty(name="Controller Empty", type=bpy.types.Object, description="The Empty that drives this shape")
+    icon: EnumProperty(items=[('MESH_CUBE', "Cube", ""), ('MESH_CYLINDER', "Cylinder", ""), ('MESH_UVSPHERE', "Sphere", ""), ('MESH_CONE', "Cone", ""), ('MESH_ICOSPHERE', "Prism", ""), ('MESH_TORUS', "Torus", ""), ('CURVE_BEZCURVE', "Curve", ""), ('MESH_MONKEY', "Mesh", ""), ('SCULPTMODE_HLT', "Sculpt", "")], default='MESH_CUBE')
+    
+    # --- UI & MUTE PROPERTIES ---
+    is_hidden: BoolProperty(name="Mute Shape", default=False, update=update_visibility_and_mute)
+    is_viewport_hidden: BoolProperty(name="Hide Empty", default=False, update=update_visibility_and_mute)
+    
+    # --- COMMON SHADER PROPERTIES ---
     use_highlight: BoolProperty(name="Highlight Shape", default=False, update=_redraw_shader_view)
     operation: EnumProperty(
         name="Operation",
-        items=[('SMOOTH_UNION', "Smooth Union", ""), ('SMOOTH_SUBTRACT', "Smooth Subtract", ""), ('SMOOTH_INTERSECT', "Smooth Intersect", "")],
-        default='SMOOTH_UNION',
+        items=[
+            ('UNION', "Union", "Combine two shapes"),
+            ('SUBTRACT', "Subtract", "Carve the second shape from the first"),
+            ('INTERSECT', "Intersect", "Keep only the overlapping volume"),
+            ('PAINT', "Paint", "Casts color onto shapes below it"),
+            ('DISPLACE', "Displace", "Deforms the base shape outwards"),
+            ('INDENT', "Indent", "Deforms the base shape inwards"),
+            ('RELIEF', "Relief", "The second shape carves the first, while both remain visible"),
+            ('ENGRAVE', "Engrave", "The first shape carves the second, while both remain visible"),
+            ('MASK', "Mask", "Reveals the shape below using the current shape as a stencil")
+        ],
+        default='UNION',
         update=_redraw_shader_view
     )
-    blend: FloatProperty(name="Blend", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
-    preview_color: FloatVectorProperty(name="Preview Color", subtype='COLOR', default=(1.0, 1.0, 1.0), min=0.0, max=1.0, update=_redraw_shader_view)
+
+    blend_type: EnumProperty(
+        name="Blend Type",
+        items=[
+            ('ROUND', "Round", "Creates a soft, G2-continuous rounded blend"),
+            ('CHAMFER', "Chamfer", "Creates a hard, 45-degree linear blend")
+        ],
+        default='ROUND',
+        update=_redraw_shader_view
+    )  
     
-    # --- Symmetry Properties ---
+    # --- THIS IS YOUR UPDATED PROPERTY ---
+    blend: FloatProperty(
+        name="Blend", 
+        description="Controls the smoothness of the blend between shapes.",
+        default=0.0, 
+        min=0.0, 
+        max=100.0,      # The absolute maximum value you can type in
+        soft_max=50.0, # The maximum value the UI slider will drag to
+        update=_redraw_shader_view
+    )
+    # --- END OF UPDATE ---
+
+    blend_strength: FloatProperty(
+        name="Strength", 
+        description="Controls height/depth for CSG ops, or hollowness for Mask",
+        default=0.1, 
+        # --- UPDATE THE MINIMUM VALUE ---
+        min=0.0, 
+        max=2.0, 
+        subtype='DISTANCE',
+        update=_redraw_shader_view
+    )
+    mask_fill_amount: FloatProperty(
+        name="Fill Amount",
+        description="Controls the morph from intersection (0.0) to the pure mask shape (1.0)",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR', # This makes it a 0-1 slider
+        update=_redraw_shader_view
+    )
+
+    preview_color: FloatVectorProperty(name="Preview Color", subtype='COLOR', default=(1.0, 1.0, 1.0), min=0.0, max=1.0, update=_redraw_shader_view)
+
+    # --- CUBE-SPECIFIC PROPERTIES ---
+    thickness: FloatProperty(name="Thickness", description="Creates a hole through the cube", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    roundness: FloatProperty(name="Roundness", description="Rounds the corners and edges of the shape", default=0.0, min=0.0, soft_max=1, update=_redraw_shader_view)
+    bevel: FloatProperty(name="Bevel", description="Adds a 45-degree chamfer to the shape's edges", default=0.0, min=0.0, soft_max=0.5, update=_redraw_shader_view)
+    pyramid: FloatProperty(name="Pyramid", description="Tapers the top of the cube to a point", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    twist: FloatProperty(name="Twist", description="Twists the cube around its Z-axis", default=0.0, min=-20.0, max=20.0, update=_redraw_shader_view)
+    bend: FloatProperty(name="Bend", description="Bends the cube along its X-axis", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    
+    # --- SPHERE-SPECIFIC PROPERTIES ---
+    sphere_thickness: FloatProperty(name="Thickness", description="Creates a subtractive hole through the sphere", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    sphere_elongation: FloatProperty(name="Elongation", description="Stretches the sphere into a capsule along the Z-axis", default=0.0, min=0.0, soft_max=2.0, update=_redraw_shader_view)
+    sphere_cut_angle: FloatProperty(
+        name="Pac-man",
+        description="The visible angle of the sphere wedge, from 0 (invisible) to 360 (full sphere)",
+        default=math.tau,
+        min=0.0,
+        max=math.tau,
+        soft_min=0.0,
+        soft_max=math.tau,
+        subtype='ANGLE',
+        update=_redraw_shader_view
+    )
+
+    # --- CYLINDER-SPECIFIC PROPERTIES ---
+    cylinder_thickness: FloatProperty(name="Thickness", description="Hollows the cylinder, creating a pipe", default=0.0, min=0.0, max=1.0, update=_redraw_shader_view)
+    cylinder_roundness: FloatProperty(name="Roundness", description="Rounds the sharp edges of the cylinder", default=0.0, min=0.0, soft_max=4.0, update=_redraw_shader_view)
+    cylinder_bend: FloatProperty(name="Bend", description="Bends the cylinder along its Y-axis (height)", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    cylinder_pyramid: FloatProperty(name="Pyramid", description="Tapers the top of the cylinder into a cone", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+
+    # --- PRISM-SPECIFIC PROPERTIES (NEW!) ---
+    prism_sides: IntProperty(name="Sides", description="Number of sides for the prism (N-gon)", default=6, min=3, max=16, update=_redraw_shader_view)
+    prism_thickness: FloatProperty(name="Thickness", description="Creates a hollow shell inside the prism", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    prism_bend: FloatProperty(name="Bend", description="Bends the prism along its X-axis", default=0.0, min=-2.0, max=2.0, update=_redraw_shader_view)
+    prism_twist: FloatProperty(name="Twist", description="Twists the prism around its Y-axis", default=0.0, min=-20.0, max=20.0, update=_redraw_shader_view)
+    prism_pyramid: FloatProperty(name="Pyramid", description="Tapers the top of the prism to a point", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+
+    # --- TORUS-SPECIFIC PROPERTIES (NEW!) ---
+    torus_outer_radius: FloatProperty(name="Outer Radius", description="The radius from the center to the outer edge", default=0.4, min=0.01, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
+    torus_inner_radius: FloatProperty(name="Inner Radius", description="The radius of the center hole", default=0.2, min=0.0, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
+    torus_thickness: FloatProperty(name="Thickness", description="Hollows the torus, creating a shell", default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    torus_cut_angle: FloatProperty(
+        name="Pac-man",
+        description="The visible angle of the torus wedge, from 0 (invisible) to 360 (full torus)",
+        default=math.tau,
+        min=0.0,
+        max=math.tau,
+        subtype='ANGLE',
+        update=_redraw_shader_view
+    )
+    torus_elongation: FloatProperty(
+        name="Elongation",
+        description="Stretches the torus cross-section into a capsule shape",
+        default=0.0,
+        min=0.0,
+        soft_max=1.0,
+        subtype='DISTANCE',
+        update=_redraw_shader_view
+    )
+
+    # --- SYMMETRY PROPERTIES ---
     use_mirror_x: BoolProperty(name="X", default=False, update=_redraw_shader_view)
     use_mirror_y: BoolProperty(name="Y", default=False, update=_redraw_shader_view)
     use_mirror_z: BoolProperty(name="Z", default=False, update=_redraw_shader_view)
     use_radial_mirror: BoolProperty(name="Enable Radial Mirror", default=False, update=_redraw_shader_view)
     radial_mirror_count: IntProperty(name="Count", default=6, min=2, max=64, update=_redraw_shader_view)
-    radial_mirror_offset: FloatProperty(name="Offset", default=0.0, update=_redraw_shader_view)
 
-    # --- Curve-Specific Properties ---
-    curve_mode: EnumProperty(
-        name="Curve Mode",
-        description="How to interpret the curve's shape",
-        items=[('HARD', "Hard", "Linear segments between control points"), ('SMOOTH', "Smooth", "Approximate the true curve using subdivisions")],
-        default='HARD',
+    # --- CURVE-SPECIFIC PROPERTIES ---
+    curve_mode: EnumProperty(name="Curve Mode", items=[('HARD', "Hard", ""), ('SMOOTH', "Smooth", "")], default='SMOOTH', update=_redraw_shader_view)
+    curve_point_density: IntProperty(name="Point Density", default=10, min=1, max=128, update=_redraw_shader_view)
+    curve_instance_type: EnumProperty(
+        name="Instance Shape", 
+        items=[
+            ('MESH_UVSPHERE', "Sphere", ""), 
+            ('MESH_CUBE', "Cube", ""), 
+            ('MESH_ICOSPHERE', "Prism", ""), 
+            ('CAPSULE', "Capsule", ""),
+            ('MESH_TORUS', "Torus", ""),
+            ('MESH_CYLINDER', "Cylinder", ""),
+            ('MESH_CONE', "Cone", "")
+        ], 
+        default='MESH_UVSPHERE', 
         update=_redraw_shader_view
     )
-    curve_subdivisions: IntProperty(
-        name="Subdivisions",
-        description="Number of smaller segments to approximate the curve",
-        default=4,
-        min=1,
-        max=16,
+    curve_instance_rotation: FloatVectorProperty(
+        name="Instance Rotation",
+        description="Apply an additional local rotation to each shape on the curve",
+        subtype='EULER',
+        default=(0.0, 0.0, 0.0),
         update=_redraw_shader_view
     )
-
+    curve_instance_spacing: FloatProperty(
+        name="Instance Spacing",
+        description="Controls the distance between shapes along the curve. Higher values mean more space",
+        default=1.0,
+        min=0.1,
+        soft_max=10.0,
+        subtype='FACTOR',
+        update=_redraw_shader_view
+    )
+    curve_control_mode: EnumProperty(
+        name="Control Mode",
+        items=[('UNIFORM', "Uniform", "Use a single shape for the whole curve"),
+               ('CUSTOM', "Custom Points", "Define specific points with unique properties")],
+        default='UNIFORM',
+        update=_redraw_shader_view
+    )
+    
+    custom_control_points: CollectionProperty(type=SDFCurveControlPoint)
+    active_control_point_index: IntProperty(default=-1)
+    
+    curve_point_density: IntProperty(name="Point Density", default=10, min=1, max=128, update=_redraw_shader_view)
+    curve_global_radius: FloatProperty(name="Global Radius", default=0.4, min=0.001, soft_max=2.0, subtype='DISTANCE', update=_redraw_shader_view)
+    curve_segment_scale: FloatProperty(name="Segment Scale", default=0.9, min=0.0, soft_max=1.5, subtype='FACTOR', update=_redraw_shader_view)
+    curve_taper_head: FloatProperty(name="Taper Head", default=1.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
+    curve_taper_tail: FloatProperty(name="Taper Tail", default=1.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
 
 # -------------------------------------------------------------------
 # 2) List of classes to register (excluding PropertyGroup)
@@ -3641,12 +4803,19 @@ _classes = [
     SDFPrototyperPanel,
     SDFRenderPanel,
     SDF_UL_nodes,
+    SDF_UL_curve_points,
     VIEW3D_MT_sdf_rclick,
+
+    # Data Structures (must be registered before classes that use them)
+    SDFCurveControlPoint,
 
     # Core SDF Generation & Conversion
     StartSDFOperator,
     ConvertSDFOperator,
     OBJECT_OT_sdf_bake_volume,
+    OBJECT_OT_sdf_bake_to_remesh,
+    OBJECT_OT_sdf_auto_uv,                    
+    OBJECT_OT_sdf_snap_selection_to_active, 
 
     # Add SDF Shape Operators
     SDFCubeAdd, SDFCylinderAdd, SDFUVSphereAdd, SDFConeAdd,
@@ -3657,12 +4826,16 @@ _classes = [
     PROTOTYPER_OT_SDFListMove,
     SDFDuplicateOperator, SDFDeleteOperator, SDFClearOperator,
     PROTOTYPER_OT_SDFRepeatShape,
-    PROTOTYPER_OT_SDFFlipShape,
     PROTOTYPER_OT_SDFCleanupList,
     PROTOTYPER_OT_toggle_smooth,
+    PROTOTYPER_OT_SDFCurvePointAdd, 
+    PROTOTYPER_OT_SDFCurvePointRemove,
 
     # Symmetry Baking Operator
     OBJECT_OT_bake_sdf_symmetry,
+    PROTOTYPER_OT_SDFSymmetrize, 
+    PROTOTYPER_OT_SDFFlipActiveShape,
+    PROTOTYPER_OT_SDFFlipModel,
 
     # Domain & Global Control Operators
     OBJECT_OT_reset_global_scale,
@@ -3695,110 +4868,103 @@ _timer_is_running = False
 def register():
     global _addon_keymaps, _timer_is_running
 
-    # A) Register the unified PropertyGroup which now includes all curve properties
+    # --- STEP 1: Register all helper classes FIRST ---
+    # This includes SDFCurveControlPoint, operators, panels, etc.
+    for cls in _classes:
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            pass # Class is already registered
+
+    # --- STEP 2: Now that its dependencies are registered, register the main data class ---
     bpy.utils.register_class(SDFNodeItem)
 
-    # B) Attach it to Object
+    # --- STEP 3: Attach properties to Blender's built-in types ---
     bpy.types.Object.sdf_nodes = bpy.props.CollectionProperty(type=SDFNodeItem)
     bpy.types.Object.active_sdf_node_index = bpy.props.IntProperty(default=-1)
 
-    # C) Define Scene properties
+    # --- STEP 4: Define and attach all Scene properties ---
     Scene = bpy.types.Scene
     Scene.sdf_domain                   = bpy.props.PointerProperty(type=bpy.types.Object)
-    
-    # --- NEW MAX SHAPES PROPERTY ---
     Scene.sdf_max_shapes = bpy.props.IntProperty(
         name="Max Shapes",
-        description="The maximum number of shapes the shader can handle. WARNING: Higher values can impact performance",
-        default=32,
-        min=8,
-        max=256
+        description="Shader shape limit. High values require a powerful GPU. Change requires restart",
+        default=32, min=8, max=2048, step=4 
     )
-    # --- END NEW ---
-
     Scene.lock_sdf_panel               = bpy.props.BoolProperty(name="Lock SDF Panel", default=False, update=update_lock)
     Scene.locked_sdf_object            = bpy.props.PointerProperty(type=bpy.types.Object)
-
     Scene.sdf_status_message           = bpy.props.StringProperty(default="Ready")
-    Scene.sdf_auto_resolution_enable   = bpy.props.BoolProperty(
-        name="Automatic Preview", default=False, update=toggle_auto_resolution_mode)
-    Scene.sdf_preview_mode             = bpy.props.BoolProperty(
-        name="Preview Mode", default=True, update=update_sdf_resolution)
-    Scene.sdf_preview_resolution       = bpy.props.IntProperty(
-        name="Low-Res", default=1, min=1, soft_max=64, update=update_sdf_resolution)
-    Scene.sdf_final_resolution         = bpy.props.IntProperty(
-        name="High-Res", default=3, min=1, soft_max=512, update=update_sdf_resolution)
-    Scene.sdf_auto_threshold           = bpy.props.FloatProperty(
-        name="Movement Sensitivity", default=1e-5, min=1e-6, max=1e-3)
-    Scene.sdf_auto_idle_delay          = bpy.props.FloatProperty(
-        name="Idle Delay (s)", default=0.5, min=0.1, max=2.0)
-
+    Scene.sdf_auto_resolution_enable   = bpy.props.BoolProperty(name="Automatic Preview", default=False, update=toggle_auto_resolution_mode)
+    Scene.sdf_preview_mode             = bpy.props.BoolProperty(name="Preview Mode", default=True, update=update_sdf_resolution)
+    Scene.sdf_preview_resolution       = bpy.props.IntProperty(name="Low-Res", default=1, min=1, soft_max=64, update=update_sdf_resolution)
+    Scene.sdf_final_resolution         = bpy.props.IntProperty(name="High-Res", default=3, min=1, soft_max=512, update=update_sdf_resolution)
+    Scene.sdf_auto_threshold           = bpy.props.FloatProperty(name="Movement Sensitivity", default=1e-5, min=1e-6, max=1e-3)
+    Scene.sdf_auto_idle_delay          = bpy.props.FloatProperty(name="Idle Delay (s)", default=0.5, min=0.1, max=2.0)
     Scene.sdf_decimation_enable        = bpy.props.BoolProperty(name="Enable Decimation", default=False)
-    Scene.sdf_global_scale             = bpy.props.FloatProperty(
-        name="Global Scale", default=1.0, min=0.1, max=10.0, update=update_sdf_global_scale)
-
+    Scene.sdf_global_scale             = bpy.props.FloatProperty(name="Global Scale", default=1.0, min=0.1, max=10.0, update=update_sdf_global_scale)
     Scene.use_brush_cube               = bpy.props.BoolProperty(name="Use Brush Cube", default=False)
     Scene.brush_cube                   = bpy.props.PointerProperty(type=bpy.types.Object)
     Scene.clip_enabled                 = bpy.props.BoolProperty(name="Clipping Enabled", default=False)
-
     Scene.sdf_render_panel_enable      = bpy.props.BoolProperty(name="Show Render Options", default=False)
-    Scene.sdf_render_from              = bpy.props.EnumProperty(
-        name="Render From", items=[('CAMERA','Camera',''),('VIEW','View','')], default='CAMERA')
+    Scene.sdf_render_from              = bpy.props.EnumProperty(name="Render From", items=[('CAMERA','Camera',''),('VIEW','View','')], default='CAMERA')
     Scene.sdf_render_highres_resolution= bpy.props.IntProperty(name="Res", default=3, min=1, max=1024)
     Scene.sdf_render_scale             = bpy.props.FloatProperty(name="Scale", default=1.0, min=0.1, max=2.0)
-    Scene.sdf_render_engine            = bpy.props.EnumProperty(
-        name="Engine",
-        items=[('BLENDER_EEVEE_NEXT','Eevee',''),('CYCLES','Cycles','')],
-        default='BLENDER_EEVEE_NEXT'
-    )
+    Scene.sdf_render_engine            = bpy.props.EnumProperty(name="Engine", items=[('BLENDER_EEVEE_NEXT','Eevee',''),('CYCLES','Cycles','')], default='BLENDER_EEVEE_NEXT')
     Scene.sdf_render_samples           = bpy.props.IntProperty(name="Eevee Samples", default=5, min=1, max=4096)
     Scene.sdf_cycles_samples           = bpy.props.IntProperty(name="Cycles Max", default=5, min=1, max=4096)
     Scene.sdf_cycles_preview_samples   = bpy.props.IntProperty(name="Cycles Min", default=16, min=1, max=4096)
-    Scene.sdf_render_shading_mode      = bpy.props.EnumProperty(
-        name="Shading Mode",
-        items=[('CURRENT','Current',''),('MATERIAL','Material',''),('RENDERED','Rendered','')],
-        default='CURRENT'
-    )
+    Scene.sdf_render_shading_mode      = bpy.props.EnumProperty(name="Shading Mode", items=[('CURRENT','Current',''),('MATERIAL','Material',''),('RENDERED','Rendered','')], default='CURRENT')
     Scene.sdf_render_disable_overlays  = bpy.props.BoolProperty(name="Disable Overlays", default=False)
-
-    Scene.sdf_shape_tab                = bpy.props.EnumProperty(
-        name="Shape Tab",
-        items=[('BASIC','Basic',''),('DEFORM','Deform',''),('STYLE','Style',''),('MISC','Misc','')],
-        default='BASIC'
-    )
-
-    Scene.sdf_global_tint    = bpy.props.FloatVectorProperty(
-        name="Global Tint", subtype='COLOR',
-        default=(1.0,1.0,1.0), min=0.0, max=1.0,
-        description="Multiply shape colors globally",
+    Scene.sdf_shape_tab                = bpy.props.EnumProperty(name="Shape Tab", items=[('BASIC','Basic',''),('DEFORM','Deform',''),('STYLE','Style',''),('MISC','Misc','')], default='BASIC')
+    Scene.sdf_global_tint              = bpy.props.FloatVectorProperty(name="Global Tint", subtype='COLOR', default=(1.0,1.0,1.0), min=0.0, max=1.0, description="Multiply shape colors globally", update=_redraw_shader_view)
+    Scene.sdf_light_direction = bpy.props.FloatVectorProperty(
+        name="Light Direction",
+        subtype='DIRECTION',
+        default=(0.6, 0.6, 0.5),
         update=_redraw_shader_view
     )
-    Scene.sdf_light_azimuth  = bpy.props.FloatProperty(
-        name="Light Azimuth", default=45.0,
-        min=0.0, max=360.0, subtype='ANGLE',
+    Scene.sdf_preview_brightness = bpy.props.FloatProperty(
+        name="Brightness",
+        default=0.0, min=-1.0, max=1.0,
         update=_redraw_shader_view
     )
-    Scene.sdf_light_elevation= bpy.props.FloatProperty(
-        name="Light Elevation", default=45.0,
-        min=-90.0, max=90.0, subtype='ANGLE',
+    Scene.sdf_preview_contrast = bpy.props.FloatProperty(
+        name="Contrast",
+        default=1.0, min=0.0, max=2.0,
         update=_redraw_shader_view
     )
-    Scene.sdf_shader_view = bpy.props.BoolProperty(
-        name="Enable SDF Shader View", default=False,
-        update=lambda s,c: enable_sdf_shader_view(s.sdf_shader_view)
+    Scene.sdf_cavity_enable = bpy.props.BoolProperty(
+        name="Enable Cavity",
+        description="Calculate ambient occlusion to add detail. May impact performance.",
+        default=True,
+        update=_redraw_shader_view
     )
-    Scene.sdf_color_blend_mode = bpy.props.EnumProperty(
-        name="Color Blend",
-        items=[('HARD',"Hard","Pick one shape’s color"),('SOFT',"Soft","Interpolate in smooth areas")],
-        default='HARD'
+    Scene.sdf_cavity_strength = bpy.props.FloatProperty(
+        name="Strength",
+        description="How strong the cavity/occlusion effect is",
+        default=0.5, 
+        min=0.0, 
+        max=20.0,      # Increased hard limit
+        soft_max=5.0,  # Increased soft limit for the slider
+        update=_redraw_shader_view
+    )
+    Scene.sdf_shader_view              = bpy.props.BoolProperty(name="Enable SDF Shader View", default=False, update=lambda s,c: enable_sdf_shader_view(s.sdf_shader_view))
+    Scene.sdf_color_blend_mode         = bpy.props.EnumProperty(name="Color Blend", items=[('HARD',"Hard","Pick one shape’s color"),('SOFT',"Soft","Interpolate in smooth areas")], default='HARD')
+    Scene.sdf_domain_scale             = bpy.props.FloatProperty(name="Domain Scale", description="Sets the size of the SDF evaluation space. Inactive when Brush-Cube Clipping is on", default=1.0, min=0.01, soft_max=10.0, update=update_sdf_domain_scale)
+    Scene.sdf_visualization_mode       = bpy.props.EnumProperty(name="Visualization Mode", items=[('SOLID', "Solid", "Render the SDF as a solid mesh"), ('POINTS', "Points", "Render the SDF as a fast point cloud")], default='SOLID', update=lambda self, context: rewire_full_sdf_chain(context))
+    Scene.sdf_view_mode = bpy.props.EnumProperty(
+        name="View Filter",
+        description="Controls which shapes are visible in the shader view and baking",
+        items=[
+            ('ALL', "Show All", "Display all shapes"),
+            ('SELECTED', "Selected", "Display only the selected shapes"),
+            ('UNSELECTED', "Unselected", "Display only the unselected shapes")
+        ],
+        default='ALL',
+        update=_redraw_shader_view # Trigger a redraw when the mode changes
     )
 
-    # D) Register all other classes
-    for cls in _classes:
-        try: bpy.utils.register_class(cls)
-        except ValueError: pass
-
-    # E) Handlers & menus
+    # --- STEP 5: Add handlers, menus, and keymaps ---
     if check_mute_nodes not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(check_mute_nodes)
     if depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
@@ -3809,7 +4975,6 @@ def register():
     bpy.types.VIEW3D_MT_mesh_add.prepend(add_sdf_shapes)
     bpy.types.VIEW3D_MT_object_context_menu.prepend(rclick_sdf_menu)
 
-    # F) Keymaps
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if kc:
@@ -3819,7 +4984,6 @@ def register():
         kmi = km.keymap_items.new('prototyper.sdf_list_move','MINUS','PRESS')
         kmi.properties.direction='DOWN';  _addon_keymaps.append((km,kmi))
 
-    # G) Start auto‐preview timer
     _timer_is_running = True
     bpy.app.timers.register(monitor_sdf_movement)
 
@@ -3830,15 +4994,12 @@ def register():
 def unregister():
     global _addon_keymaps, _timer_is_running
 
-    # A) Stop timer
     _timer_is_running = False
 
-    # B) Remove keymaps
     for km,kmi in _addon_keymaps:
         km.keymap_items.remove(kmi)
     _addon_keymaps.clear()
 
-    # C) Handlers & menus
     if check_mute_nodes in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.remove(check_mute_nodes)
     if depsgraph_update in bpy.app.handlers.depsgraph_update_post:
@@ -3849,21 +5010,25 @@ def unregister():
     bpy.types.VIEW3D_MT_mesh_add.remove(add_sdf_shapes)
     bpy.types.VIEW3D_MT_object_context_menu.remove(rclick_sdf_menu)
 
-    # D) Unregister all other classes
-    for cls in reversed(_classes):
-        try: bpy.utils.unregister_class(cls)
-        except ValueError: pass
-
-    # E) Unregister PropertyGroup
+    # --- REVERSE THE REGISTRATION ORDER ---
+    # Unregister the main data class FIRST
     bpy.utils.unregister_class(SDFNodeItem)
+
+    # Unregister all other helper classes
+    for cls in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except (RuntimeError, ValueError):
+            pass
+
+    # Delete custom properties from Blender's types
     del bpy.types.Object.sdf_nodes
     del bpy.types.Object.active_sdf_node_index
 
-    # F) Delete Scene props
+    # Delete Scene props
     Scene = bpy.types.Scene
-    # This list now includes the new sdf_max_shapes property for clean uninstallation
     props_to_del = [
-        "sdf_domain", "sdf_max_shapes", "lock_sdf_panel", "locked_sdf_object",
+        "sdf_domain", "sdf_domain_scale", "sdf_max_shapes", "lock_sdf_panel", "locked_sdf_object",
         "sdf_status_message", "sdf_auto_resolution_enable", "sdf_preview_mode",
         "sdf_preview_resolution", "sdf_final_resolution", "sdf_auto_threshold",
         "sdf_auto_idle_delay", "sdf_decimation_enable", "sdf_global_scale",
@@ -3873,8 +5038,13 @@ def unregister():
         "sdf_render_samples", "sdf_cycles_samples", "sdf_cycles_preview_samples",
         "sdf_render_shading_mode", "sdf_render_disable_overlays",
         "sdf_shape_tab", "sdf_shader_view", "sdf_global_tint",
-        "sdf_light_azimuth", "sdf_light_elevation"
+        "sdf_light_azimuth", "sdf_light_elevation", "sdf_color_blend_mode",
+        "sdf_visualization_mode",
+        "sdf_view_mode" # <-- ADD THIS LINE
     ]
     for p in props_to_del:
         if hasattr(Scene, p):
-            delattr(Scene, p)
+            try:
+                delattr(Scene, p)
+            except Exception:
+                pass
