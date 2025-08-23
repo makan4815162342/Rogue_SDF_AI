@@ -5,6 +5,7 @@ Rogue SDF AI is an Add-On initially made to improve SDF Prototyer Add-On but as 
 I don't know where to begin TBH I added a lot of features to this Add-On, in short this Add-On is in two sections: The 3D Geometry with SDF behaviour, drastically improved. The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep add and improve it.
 Please try it and let me know about the bugs and help me to improve it. 
 
+
 New Update:
 
 Improved and added lots of features, my next attempt will be making a better export with C++ and an SDF Render Engine with C++: 
