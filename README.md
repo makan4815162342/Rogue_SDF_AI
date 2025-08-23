@@ -36,6 +36,25 @@ The SDF Section: You have to first click the SDF Shader View button, you will be
 
 That's it for overviewing the buttons for everything I added so far! there are a lot to be added, and I will keep updating it, please let me know about your thoughts and try it, I will fix the Mac problem, I will add tooltips, and support for Vulkan... Be sure to check out my other Add-Ons as well and join my Discord for support and follow me on X. Here some Screenshot from the Add-On:
 
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 23 - 02 28 53 89" src="https://github.com/user-attachments/assets/bb03a8b7-f81e-4985-a16d-1375592b6817" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 23 - 04 01 34 47" src="https://github.com/user-attachments/assets/984b8863-9373-409c-973b-50c1c92fdb79" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 22 - 08 26 20 73" src="https://github.com/user-attachments/assets/0d211187-0b5d-41a8-9e54-f5667842065a" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 20 - 00 33 31 50" src="https://github.com/user-attachments/assets/c89a35b2-d5c9-4509-8651-f74f5d21ce9b" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 20 - 02 12 36 68" src="https://github.com/user-attachments/assets/0c556d60-86a8-4de4-aad2-0ccf3d9fadb1" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 21 - 03 11 20 53" src="https://github.com/user-attachments/assets/5598cd32-b019-425a-b6ea-97a01bc8b055" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 15 - 19 57 31 17" src="https://github.com/user-attachments/assets/904a8293-0c9e-4e64-a140-7fa977471f4a" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 07 - 20 14 52 38" src="https://github.com/user-attachments/assets/4e5ba8bb-778d-4305-8ea1-08f6c094dfa9" />
+
+<img width="2560" height="1080" alt="Custom Spline Chain_3" src="https://github.com/user-attachments/assets/e634d95c-32ea-4aa2-af7d-845a9cae5cfc" />
+
 <img width="2560" height="1080" alt="Rogue_SDF_AI_Progress" src="https://github.com/user-attachments/assets/3692a093-d5a8-4c04-b00a-f6a97a9a2253" />
 
 <img width="2560" height="1080" alt="Desktop Screenshot 2025 07 19 - 05 37 55 50" src="https://github.com/user-attachments/assets/b9058ce7-043d-4220-82a0-a4175a1080bf" />
