@@ -8,6 +8,18 @@ The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep ad
 
 Please try it and let me know about the bugs and help me to improve it.
 
+
+New Update:
+
+Added Performance Control for Ray Marching two slider quality steps and performance scale to make it run faster.
+
+Added Remesh with Voxel and QuadriFlow as a new button for better Retopology.
+
+Added Groove and Pipe as new Blending Types.
+
+Canceled: Added Texture Buffer Object (TBO) support to the shader that enables the Add-On to Add 1024 shapes and even more., paused.
+
+
 New Update:
 
 Improved and added lots of features, my next attempt will be making a better export with C++ and an SDF Render Engine with C++:
@@ -104,6 +116,20 @@ The SDF Section: You have to first click the SDF Shader View button, you will be
 
 That's it for overviewing the buttons for everything I added so far! there are a lot to be added, and I will keep updating it, please let me know about your thoughts and try it, I will fix the Mac problem, I will add tooltips, and support for Vulkan... Be sure to check out my other Add-Ons as well and join my Discord for support and follow me on X. Here some Screenshot from the Add-On:
 
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 27 - 05 37 50 13" src="https://github.com/user-attachments/assets/6786924c-a048-483d-8cc0-abf495ec241e" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 29 - 03 43 20 36" src="https://github.com/user-attachments/assets/d5e3b8bb-a941-4ecb-9195-b3250e4a18a3" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 29 - 03 43 00 29" src="https://github.com/user-attachments/assets/77f569d9-c631-4448-bbf3-5aba21a222da" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 29 - 03 41 51 74" src="https://github.com/user-attachments/assets/7d36904a-6c6a-4a79-96a7-17cb3e9bc8dc" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 29 - 03 42 17 89" src="https://github.com/user-attachments/assets/a848bda4-0c6c-42fe-a9be-78688f6a74c1" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 26 - 09 35 17 97" src="https://github.com/user-attachments/assets/b0686aa0-c26d-4a4d-ac13-633f19da4d11" />
+
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 25 - 04 57 34 59" src="https://github.com/user-attachments/assets/37f34741-8b62-45a9-8526-b765d9132a78" />
 
 <img width="2560" height="1080" alt="Desktop Screenshot 2025 08 23 - 02 28 53 89" src="https://github.com/user-attachments/assets/bb03a8b7-f81e-4985-a16d-1375592b6817" />
 
