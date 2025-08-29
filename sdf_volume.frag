@@ -263,6 +263,32 @@ float opChamferU(float a, float b, float r) { if (r <= 0.0) return min(a, b); re
 float opChamferSub(float a, float b, float r) { if (r <= 0.0) return max(a, -b); return max(a, -b) + r*0.70710678; }
 float opChamferI(float a, float b, float r) { if (r <= 0.0) return max(a, b); return max(a, b) - r*0.70710678; }
 
+// FINAL: Groove (Concave/Inverted Round) Blending Functions
+float opGrooveU(float A, float B, float k) { if (k <= 0.) return min(A, B); float h = clamp(0.5 + 0.5 * (B - A) / k, 0., 1.); return mix(B, A, h) + k * h * (1. - h); }
+float opGrooveSub(float A, float B, float k) { if (k <= 0.) return max(A, -B); float h = clamp(0.5 - 0.5 * (A + B) / k, 0., 1.); return mix(A, -B, h) - k * h * (1. - h); }
+float opGrooveI(float A, float B, float k) { if (k <= 0.) return max(A, B); float h = clamp(0.5 - 0.5 * (B - A) / k, 0., 1.); return mix(B, A, h) - k * h * (1. - h); }
+
+// FINAL: Pipe (Exterior Bead) Blending Functions
+float opPipe(float a, float b, float r) {
+    // This helper function defines the pipe geometry itself at the intersection.
+    return opRoundI(a, b, r * 0.5) - r;
+}
+
+float opPipeU(float a, float b, float r) {
+    // Union: The result is the union of the original shapes AND the pipe.
+    return min(min(a, b), opPipe(a, b, r));
+}
+
+float opPipeSub(float a, float b, float r) {
+    // Subtract: The result is the subtraction, with the pipe added along the seam.
+    return min(max(a, -b), opPipe(a, b, r));
+}
+
+float opPipeI(float a, float b, float r) {
+    // Intersect: The result is just the pipe itself, as it's defined by the intersection.
+    return opPipe(a, b, r);
+}
+
 
 // 'k' is 'Smoothness'/'Chamfer', 'strength' is 'Strength', 'fill' is 'Fill Amount'
 Hit combine(Hit A, Hit B, int op, float k, float strength, float fill) {
@@ -294,18 +320,24 @@ Hit combine(Hit A, Hit B, int op, float k, float strength, float fill) {
     else if (op == 13) { d = opChamferU(da, db, k); }
     else if (op == 14) { d = opChamferSub(da, db, k); }
     else if (op == 15) { d = opChamferI(da, db, k); }
+    else if (op == 23) { d = opGrooveU(da, db, k); }
+    else if (op == 24) { d = opGrooveSub(da, db, k); }
+    else if (op == 25) { d = opGrooveI(da, db, k); }
+    else if (op == 33) { d = opPipeU(da, db, k); }
+    else if (op == 34) { d = opPipeSub(da, db, k); }
+    else if (op == 35) { d = opPipeI(da, db, k); }
     else { d = min(da, db); } // Hard Union
 
     // --- Unified Color Blending for Standard & Chamfer Ops ---
-    bool isChamfer = (op >= 13 && op <= 15);
-    if (uColorBlendMode == 1 && k > 0.0 && !isChamfer) { // Soft Color Blending (only for Round)
-        if (op == 3) { h_col = clamp(0.5 + 0.5 * (db - da) / k, 0., 1.); c = mix(B.col, A.col, h_col); id = h_col < 0.5 ? B.id : A.id; }
-        else if (op == 4) { h_col = clamp(0.5 - 0.5 * (da + db) / k, 0., 1.); c = mix(A.col, B.col, h_col); id = h_col < 0.5 ? A.id : B.id; }
+    bool isSmoothBlend = (op >= 3 && op <= 5) || (op >= 23 && op <= 35); // Updated to include Groove and Pipe
+    if (uColorBlendMode == 1 && k > 0.0 && isSmoothBlend) { // Soft Color Blending
+        if (op == 3 || op == 23 || op == 33) { h_col = clamp(0.5 + 0.5 * (db - da) / k, 0., 1.); c = mix(B.col, A.col, h_col); id = h_col < 0.5 ? B.id : A.id; }
+        else if (op == 4 || op == 24 || op == 34) { h_col = clamp(0.5 - 0.5 * (da + db) / k, 0., 1.); c = mix(A.col, B.col, h_col); id = h_col < 0.5 ? A.id : B.id; }
         else { h_col = clamp(0.5 - 0.5 * (db - da) / k, 0., 1.); c = mix(B.col, A.col, h_col); id = h_col < 0.5 ? B.id : A.id; }
-    } else { // Hard Color Blending (for Hard, Chamfer, and non-blended ops)
-        if (op == 4 || op == 14) { // Subtract
+    } else { // Hard Color Blending
+        if (op == 4 || op == 14 || op == 24 || op == 34) { // Subtract
              if (da > -db) { c = A.col; id = A.id; } else { c = B.col; id = B.id; }
-        } else if (op == 5 || op == 15) { // Intersect
+        } else if (op == 5 || op == 15 || op == 25 || op == 35) { // Intersect
             if (da > db) { c = A.col; id = A.id; } else { c = B.col; id = B.id; }
         } else { // Union
             if (da < db) { c = A.col; id = A.id; } else { c = B.col; id = B.id; }

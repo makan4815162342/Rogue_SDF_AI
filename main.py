@@ -169,10 +169,16 @@ def collect_sdf_data(context):
         if len(shapes) >= MAX_SHAPES_CURRENT:
             continue
 
+        # In function collect_sdf_data, inside the for loop:
         op_base = op_map.get(item.operation, 3)
         op = op_base
-        if item.operation in ['UNION', 'SUBTRACT', 'INTERSECT'] and item.blend_type == 'CHAMFER':
-            op = op_base + 10
+        if item.operation in ['UNION', 'SUBTRACT', 'INTERSECT']:
+            if item.blend_type == 'CHAMFER':
+                op = op_base + 10
+            elif item.blend_type == 'GROOVE':
+                op = op_base + 20
+            elif item.blend_type == 'PIPE':
+                op = op_base + 30
         
         # ... (the rest of the function from this point on is identical to your current version)
         code = { 'MESH_CUBE': 0, 'MESH_UVSPHERE': 1, 'MESH_TORUS': 2, 'MESH_CYLINDER': 3, 'MESH_CONE': 4, 'MESH_ICOSPHERE': 5, 'CAPSULE': 6 }.get(item.icon, -1)
@@ -376,6 +382,9 @@ def draw_sdf_shader():
     shader.uniform_float("uContrast", scene.sdf_preview_contrast)
     shader.uniform_int("uCavityEnable", int(scene.sdf_cavity_enable))
     shader.uniform_float("uCavityStrength", scene.sdf_cavity_strength)
+
+    shader.uniform_int("uMaxSteps", scene.sdf_raymarch_max_steps)
+    shader.uniform_int("uPixelationAmount", scene.sdf_pixelation_amount)
     # --- END OF UPDATE ---
 
     shader.uniform_float("uGlobalTint", scene.sdf_global_tint)
@@ -1304,6 +1313,9 @@ import textwrap
 import array
 
 
+
+# In main.py, replace your OBJECT_OT_sdf_bake_volume class with this one.
+
 class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
     """Creates a high-quality, retopologized mesh from the SDF Domain via a refinement pipeline"""
     bl_idname = "object.sdf_bake_volume"
@@ -1331,10 +1343,17 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
     auto_uv_unwrap: bpy.props.BoolProperty(name="Auto UV Unwrap", default=True)
     texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=256, max=4096)
 
-    # --- Retopology & Polish Properties ---
-    retopology_method: bpy.props.EnumProperty(name="Retopology Method", items=[('NONE', "None", ""), ('VOXEL', "Voxel Remesh", ""), ('QUADRIFLOW', "QuadriFlow Remesh", "")], default='QUADRIFLOW')
+    # --- Retopology & Polish Properties (QUADRIFLOW REMOVED) ---
+    retopology_method: bpy.props.EnumProperty(name="Retopology Method", items=[('NONE', "None", ""), ('VOXEL', "Voxel Remesh", "")], default='NONE')
+    
+    # --- Full Voxel Properties ---
     voxel_remesh_size: bpy.props.FloatProperty(name="Voxel Size", default=0.01, min=0.001, max=1.0, precision=4)
-    quadriflow_target_faces: bpy.props.IntProperty(name="Target Face Count", default=5000, min=100, max=100000)
+    voxel_remesh_adaptivity: bpy.props.FloatProperty(name="Adaptivity", default=0.0, min=0.0, max=1.0)
+    voxel_fix_poles: bpy.props.BoolProperty(name="Fix Poles", default=False)
+    voxel_preserve_volume: bpy.props.BoolProperty(name="Preserve Volume", default=True)
+    voxel_preserve_attributes: bpy.props.BoolProperty(name="Preserve Attributes", description="Keeps attributes like Vertex Colors intact", default=True)
+
+    # --- Polishing Properties ---
     add_subdivision_modifier: bpy.props.BoolProperty(name="Add Subdivision Surface", default=False)
     subdivision_levels: bpy.props.IntProperty(name="Subdivision Levels", default=2, min=1, max=6)
     add_smooth_modifier: bpy.props.BoolProperty(name="Add Classic Smooth", default=False)
@@ -1343,57 +1362,17 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
     add_corrective_smooth_modifier: bpy.props.BoolProperty(name="Add Corrective Smooth", default=False)
     shade_smooth: bpy.props.BoolProperty(name="Shade Smooth", default=False)
 
-    generate_splats: bpy.props.BoolProperty(
-        name="Generate Splats",
-        description="Generate a separate object with geometric splats scattered on the surface",
-        default=False
-    )
-    splat_shape: bpy.props.EnumProperty(
-        name="Shape",
-        items=[
-            ('SQUARE', "Square", ""),
-            ('CIRCLE', "Circle", ""),
-            ('TRIANGLE', "Triangle", "")
-        ],
-        default='SQUARE'
-    )
-    splat_density: bpy.props.FloatProperty(
-        name="Density",
-        description="Number of splats per square meter",
-        default=100.0, min=1.0, soft_max=1000.0
-    )
-    splat_size_min: bpy.props.FloatProperty(
-        name="Min Size",
-        default=0.05, min=0.001, soft_max=1.0
-    )
-    splat_size_max: bpy.props.FloatProperty(
-        name="Max Size",
-        default=0.1, min=0.001, soft_max=20.0
-    )
-    splat_rotation_min: bpy.props.FloatProperty(
-        name="Min Rotation",
-        subtype='ANGLE', default=0.0
-    )
-    splat_rotation_max: bpy.props.FloatProperty(
-        name="Max Rotation",
-        subtype='ANGLE', default=math.pi * 2
-    )
-    splat_height_min: bpy.props.FloatProperty(
-        name="Min Height",
-        description="Minimum distance to offset splats from the surface",
-        default=0.0, soft_min=-20.0, soft_max=20.0
-    )
-    splat_height_max: bpy.props.FloatProperty(
-        name="Max Height",
-        description="Maximum distance to offset splats from the surface",
-        default=0.0, soft_min=-20.0, soft_max=20.0
-    )
-    texture_path: bpy.props.StringProperty(
-        name="Output Path",
-        description="Directory to save the baked texture. Defaults to the blend file's location. If file is unsaved, defaults to Desktop",
-        subtype='DIR_PATH',
-        default="//"
-    )    
+    # --- Splat Generation Properties ---
+    generate_splats: bpy.props.BoolProperty(name="Generate Splats", default=False)
+    splat_shape: bpy.props.EnumProperty(name="Shape", items=[('SQUARE', "Square", ""), ('CIRCLE', "Circle", ""), ('TRIANGLE', "Triangle", "")], default='SQUARE')
+    splat_density: bpy.props.FloatProperty(name="Density", default=100.0, min=1.0, soft_max=1000.0)
+    splat_size_min: bpy.props.FloatProperty(name="Min Size", default=0.05, min=0.001, soft_max=1.0)
+    splat_size_max: bpy.props.FloatProperty(name="Max Size", default=0.1, min=0.001, soft_max=20.0)
+    splat_rotation_min: bpy.props.FloatProperty(name="Min Rotation", subtype='ANGLE', default=0.0)
+    splat_rotation_max: bpy.props.FloatProperty(name="Max Rotation", subtype='ANGLE', default=math.pi * 2)
+    splat_height_min: bpy.props.FloatProperty(name="Min Height", default=0.0, soft_min=-20.0, soft_max=20.0)
+    splat_height_max: bpy.props.FloatProperty(name="Max Height", default=0.0, soft_min=-20.0, soft_max=20.0)
+    texture_path: bpy.props.StringProperty(name="Output Path", subtype='DIR_PATH', default="//")    
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self, width=450)
@@ -1423,9 +1402,18 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         col.prop(self, "bake_scale")
         
         box = layout.box(); box.label(text="Stage 2: Retopology", icon='MOD_REMESH')
-        col = box.column(); col.prop(self, "retopology_method", text="Method")
-        if self.retopology_method == 'VOXEL': sub = col.box(); sub.prop(self, "voxel_remesh_size")
-        elif self.retopology_method == 'QUADRIFLOW': sub = col.box(); sub.prop(self, "quadriflow_target_faces")
+        col = box.column()
+        col.prop(self, "retopology_method", text="Method")
+        
+        if self.retopology_method == 'VOXEL':
+            sub = col.box()
+            sub.prop(self, "voxel_remesh_size")
+            sub.prop(self, "voxel_remesh_adaptivity")
+            sub.prop(self, "voxel_fix_poles")
+            sub.prop(self, "voxel_preserve_volume")
+            sub.prop(self, "voxel_preserve_attributes")
+            
+        # QUADRIFLOW UI IS REMOVED
             
         box = layout.box(); box.label(text="Stage 3: Final Polishing", icon='MOD_SMOOTH')
         col = box.column()
@@ -1440,19 +1428,18 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         col.prop(self, "shade_smooth")
 
         if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
-                    tex_box = layout.box()
-                    tex_box.label(text="Stage 6: Texture Output", icon='TEXTURE')
-                    tex_box.prop(self, "bake_to_texture")
-                    if self.bake_to_texture:
-                        sub_tex = tex_box.box()
-                        sub_tex.prop(self, "auto_uv_unwrap")
-                        sub_tex.prop(self, "texture_resolution", text="Resolution")
-                        sub_tex.prop(self, "texture_path")
+            tex_box = layout.box()
+            tex_box.label(text="Stage 4: Texture Output", icon='TEXTURE')
+            tex_box.prop(self, "bake_to_texture")
+            if self.bake_to_texture:
+                sub_tex = tex_box.box()
+                sub_tex.prop(self, "auto_uv_unwrap")
+                sub_tex.prop(self, "texture_resolution", text="Resolution")
+                sub_tex.prop(self, "texture_path")
            
-        # --- NEW: SPLAT GENERATION UI ---
         if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
             splat_box = layout.box()
-            splat_box.label(text="Stage 7: Splat Generation", icon='PARTICLES')
+            splat_box.label(text="Stage 5: Splat Generation", icon='PARTICLES')
             splat_box.prop(self, "generate_splats")
             if self.generate_splats:
                 sub_splat = splat_box.box()
@@ -1467,22 +1454,17 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 row = sub_splat.row(align=True)
                 row.prop(self, "splat_height_min", text="Min Height")
                 row.prop(self, "splat_height_max", text="Max Height")
-        # --- END NEW UI ---
 
     def create_splat_object(self, context, source_object):
+        # ... (your existing splat code is unchanged)
         self.report({'INFO'}, "Generating live particle system for splats...")
-
-        # --- 1. Create the Splat Instance Geometry ---
         if "Splat_Instances" in bpy.data.collections:
             splat_collection = bpy.data.collections["Splat_Instances"]
         else:
             splat_collection = bpy.data.collections.new("Splat_Instances")
             context.scene.collection.children.link(splat_collection)
-        
-        # Hide the collection from the viewport, but ensure it's not excluded from the view layer
         context.view_layer.layer_collection.children[splat_collection.name].hide_viewport = True
         context.view_layer.layer_collection.children[splat_collection.name].exclude = False
-
         shape_name = f"Splat_{self.splat_shape.title()}"
         if shape_name not in splat_collection.objects:
             if self.splat_shape == 'SQUARE':
@@ -1491,71 +1473,50 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 bpy.ops.mesh.primitive_circle_add(vertices=16, fill_type='NGON')
             else: # TRIANGLE
                 bpy.ops.mesh.primitive_circle_add(vertices=3, fill_type='NGON')
-            
             splat_instance = context.active_object
             splat_instance.name = shape_name
-            # Link to our special collection and unlink from the scene's active collection
             splat_collection.objects.link(splat_instance)
             context.collection.objects.unlink(splat_instance)
-
-        # --- 2. Add and Configure the Particle System ---
         bpy.ops.object.select_all(action='DESELECT')
         context.view_layer.objects.active = source_object
         source_object.select_set(True)
-
         bpy.ops.object.particle_system_add()
         psys = source_object.particle_systems[-1]
         psys.name = "SplatParticleSystem"
-        
         psettings = psys.settings
         psettings.type = 'HAIR'
         psettings.use_advanced_hair = True
         psettings.emit_from = 'FACE'
-        
-        # --- ROBUST PARTICLE COUNT CALCULATION ---
         surface_area = sum(f.area for f in source_object.data.polygons)
         particle_count = int(self.splat_density * surface_area)
-        
-        # If the area is tiny but > 0, ensure at least one splat is made
         if particle_count == 0 and surface_area > 0:
             particle_count = 1
-            
         self.report({'INFO'}, f"Calculated Surface Area: {surface_area:.4f} m^2. Creating {particle_count} splats.")
         psettings.count = particle_count
-        # --- END OF ROBUST COUNT ---
-        
-        # --- Render & Viewport Settings ---
         psettings.render_type = 'COLLECTION'
         psettings.instance_collection = splat_collection
         psettings.particle_size = self.splat_size_min
         psettings.size_random = (self.splat_size_max - self.splat_size_min) / self.splat_size_min if self.splat_size_min > 0 else 1.0
-        
-        # Explicitly tell the viewport to show the instances
         psys.show_instancer_for_viewport = True
-        
-        # --- Rotation and Physics Settings ---
         psettings.use_rotations = True
         psettings.rotation_mode = 'NOR_TAN'
         psettings.phase_factor = self.splat_rotation_min / (math.pi * 2)
         psettings.phase_factor_random = (self.splat_rotation_max - self.splat_rotation_min) / (math.pi * 2)
-        
         psettings.physics_type = 'NEWTON'
         psettings.normal_factor = (self.splat_height_min + self.splat_height_max) / 2.0
-
-        # --- 3. Finalize ---
         bpy.ops.object.select_all(action='DESELECT')
         context.view_layer.objects.active = source_object
         source_object.select_set(True)
         self.report({'INFO'}, "Successfully added a live splat particle system.")
         
     def execute(self, context):
+        # ... (Initial checks and setup code is unchanged) ...
         if self.bake_method == 'DIRECT' and not HAS_MCUBES:
             self.report({'ERROR'}, "PyMCubes library is required for the Direct method.")
             return {'CANCELLED'}
         if self.bake_method in {'VDB', 'HYBRID'} and not HAS_OPENVDB:
             self.report({'ERROR'}, "pyopenvdb library is required for VDB/Hybrid methods.")
             return {'CANCELLED'}
-
         domain = getattr(context.scene, "sdf_domain", None)
         if not domain: self.report({'ERROR'}, "SDF Domain object not found."); return {'CANCELLED'}
         self.report({'INFO'}, f"Preparing bake with '{self.bake_method}' method...")
@@ -1584,7 +1545,6 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
             verts_world = (verts_np * voxel_size) + np.array(final_min)
             mesh_data = bpy.data.meshes.new("SDF_Mesh_Data"); mesh_data.from_pydata(verts_world.tolist(), [], faces.tolist()); mesh_data.update()
             final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", mesh_data); context.collection.objects.link(final_mesh_object)
-
         elif self.bake_method in {'VDB', 'HYBRID'}:
             try:
                 density_grid, _, _, _ = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
@@ -1605,31 +1565,9 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         if not final_mesh_object: self.report({'ERROR'}, "Mesh object was not created. Aborting."); return {'CANCELLED'}
         bpy.ops.object.select_all(action='DESELECT'); context.view_layer.objects.active = final_mesh_object; final_mesh_object.select_set(True)
         
-        if self.retopology_method == 'VOXEL':
-            self.report({'INFO'}, "Stage 3: Applying Voxel Remesh...")
-            bpy.ops.object.modifier_add(type='REMESH'); mod = final_mesh_object.modifiers[-1]
-            mod.mode = 'VOXEL'; mod.voxel_size = self.voxel_remesh_size; mod.use_smooth_shade = True
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-        elif self.retopology_method == 'QUADRIFLOW':
-            self.report({'INFO'}, "Stage 3: Applying QuadriFlow Remesh... (this may take a moment)")
-            bpy.ops.object.quadriflow_remesh(target_faces=self.quadriflow_target_faces, use_mesh_symmetry=False)
-        
-        self.report({'INFO'}, "Stage 4: Applying Final Polish...")
-        if self.add_subdivision_modifier:
-            bpy.ops.object.modifier_add(type='SUBSURF'); mod = final_mesh_object.modifiers[-1]
-            mod.levels = self.subdivision_levels; mod.render_levels = self.subdivision_levels
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-        if self.add_smooth_modifier:
-            bpy.ops.object.modifier_add(type='SMOOTH'); mod = final_mesh_object.modifiers[-1]
-            mod.factor = self.smooth_factor; mod.iterations = self.smooth_iterations
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-        if self.add_corrective_smooth_modifier:
-            bpy.ops.object.modifier_add(type='CORRECTIVE_SMOOTH')
-            bpy.ops.object.modifier_apply(modifier=final_mesh_object.modifiers[-1].name)
-
         vcol_layer = None
         if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
-            self.report({'INFO'}, "Stage 5: Applying vertex colors to final mesh...")
+            self.report({'INFO'}, "Stage 3: Applying vertex colors to initial mesh...")
             if self.bake_method == 'HYBRID':
                 self.report({'INFO'}, "Using memory-efficient slice-by-slice color sampling...")
                 mw = final_mesh_object.matrix_world
@@ -1691,127 +1629,202 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 temp_mat.node_tree.links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
             final_mesh_object.data.materials.append(temp_mat)
 
-        # --- NEW: BAKE TO TEXTURE WORKFLOW ---
-        # --- STAGE 6: BAKE TO IMAGE TEXTURE ---
-        if self.bake_to_texture and vcol_layer:
-            self.report({'INFO'}, "Stage 6: Baking vertex colors to image texture...")
+        # --- Retopology Logic (QUADRIFLOW REMOVED) ---
+        if self.retopology_method == 'VOXEL':
+            self.report({'INFO'}, "Stage 4: Applying Voxel Remesh...")
+            mesh_data = final_mesh_object.data
+            mesh_data.remesh_voxel_size = self.voxel_remesh_size
+            mesh_data.remesh_voxel_adaptivity = self.voxel_remesh_adaptivity
+            mesh_data.use_remesh_fix_poles = self.voxel_fix_poles
+            mesh_data.use_remesh_preserve_volume = self.voxel_preserve_volume
+            mesh_data.use_remesh_preserve_attributes = self.voxel_preserve_attributes
+            bpy.ops.object.voxel_remesh()
+        
+        self.report({'INFO'}, "Stage 5: Applying Final Polish...")
+        if self.add_subdivision_modifier:
+            bpy.ops.object.modifier_add(type='SUBSURF'); mod = final_mesh_object.modifiers[-1]
+            mod.levels = self.subdivision_levels; mod.render_levels = self.subdivision_levels
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        if self.add_smooth_modifier:
+            bpy.ops.object.modifier_add(type='SMOOTH'); mod = final_mesh_object.modifiers[-1]
+            mod.factor = self.smooth_factor; mod.iterations = self.smooth_iterations
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        if self.add_corrective_smooth_modifier:
+            bpy.ops.object.modifier_add(type='CORRECTIVE_SMOOTH')
+            bpy.ops.object.modifier_apply(modifier=final_mesh_object.modifiers[-1].name)
 
-            # --- 1. SAVE ORIGINAL BAKE SETTINGS ---
-            # This is the crucial fix to prevent state pollution from other operators.
-            scene = context.scene
-            original_engine = scene.render.engine
-            original_bake_settings = {
-                "use_selected_to_active": scene.render.bake.use_selected_to_active,
-                "margin": scene.render.bake.margin,
-                "use_cage": scene.render.bake.use_cage,
-                "cage_extrusion": scene.render.bake.cage_extrusion,
-            }
-
-            try:
-                # --- 2. FORCE SETTINGS FOR THIS BAKE ---
-                scene.render.engine = 'CYCLES'
-                # This bake is an EMIT bake, so 'Selected to Active' MUST be false.
-                scene.render.bake.use_selected_to_active = False
-                
-                # Ensure the object is active and selected for operations
-                bpy.ops.object.select_all(action='DESELECT')
-                context.view_layer.objects.active = final_mesh_object
-                final_mesh_object.select_set(True)
-
-                if self.auto_uv_unwrap or not final_mesh_object.data.uv_layers:
-                    self.report({'INFO'}, "Generating UVs with Smart UV Project...")
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.uv.smart_project(angle_limit=math.radians(66))
-                    bpy.ops.object.mode_set(mode='OBJECT')
-
-                if not final_mesh_object.data.uv_layers:
-                    self.report({'ERROR'}, "Bake to Texture requires UVs, but none could be found or generated.")
-                    return {'CANCELLED'}
-
-                bake_image = bpy.data.images.new(
-                    name=f"{final_mesh_object.name}_Color",
-                    width=self.texture_resolution,
-                    height=self.texture_resolution,
-                    alpha=True
-                )
-
-                bake_mat = final_mesh_object.data.materials[0]
-                tree = bake_mat.node_tree
-                nodes = tree.nodes
-                
-                vcol_attr_node = next((n for n in nodes if n.type == 'ATTRIBUTE' and n.attribute_name == vcol_layer.name), None)
-                if not vcol_attr_node:
-                    self.report({'ERROR'}, "Could not find the vertex color node for baking.")
-                    return {'CANCELLED'} # The 'finally' block will still run to restore settings
-
-                # Create temporary emission setup for a perfect bake
-                emission_node = nodes.new(type='ShaderNodeEmission')
-                tree.links.new(vcol_attr_node.outputs['Color'], emission_node.inputs['Color'])
-                
-                bsdf = nodes.get("Principled BSDF")
-                output_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
-                original_link = None
-                if bsdf and output_node and bsdf.outputs['BSDF'].links:
-                    original_link = bsdf.outputs['BSDF'].links[0]
-                
-                if output_node:
-                    tree.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
-
-                img_node = nodes.new(type='ShaderNodeTexImage')
-                img_node.image = bake_image
-                nodes.active = img_node
-                
-                scene.cycles.bake_type = 'EMIT'
-                bpy.ops.object.bake(type='EMIT')
-                
-                # --- REFINED FILEPATH LOGIC ---
-                resolved_path = bpy.path.abspath(self.texture_path)
-                if resolved_path:
-                    output_dir = resolved_path
-                else:
-                    self.report({'INFO'}, "No valid path set or blend file is unsaved. Using Desktop as fallback.")
-                    desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
-                    output_dir = desktop_dir if os.path.isdir(desktop_dir) else bpy.app.tempdir
-                
-                os.makedirs(output_dir, exist_ok=True)
-                filename = f"{final_mesh_object.name}_Color.png"
-                filepath = os.path.join(output_dir, filename)
-                self.report({'INFO'}, f"Saved baked texture to: {filepath}")
-                bake_image.save_render(filepath=filepath)
-                
-                # --- Restore original material ---
-                if original_link:
-                    tree.links.new(original_link.from_socket, original_link.to_socket)
-                
-                nodes.remove(emission_node)
-                nodes.remove(vcol_attr_node)
-                
-                if bsdf:
-                    tree.links.new(img_node.outputs['Color'], bsdf.inputs['Base Color'])
-
-            finally:
-                # --- 3. RESTORE ORIGINAL BAKE SETTINGS ---
-                # This block runs no matter what, ensuring the scene is left in a clean state.
-                self.report({'INFO'}, "Restoring original bake settings.")
-                scene.render.engine = original_engine
-                scene.render.bake.use_selected_to_active = original_bake_settings["use_selected_to_active"]
-                scene.render.bake.margin = original_bake_settings["margin"]
-                scene.render.bake.use_cage = original_bake_settings["use_cage"]
-                scene.render.bake.cage_extrusion = original_bake_settings["cage_extrusion"]
+        if self.bake_to_texture and final_mesh_object.data.vertex_colors:
+            vcol_layer = final_mesh_object.data.vertex_colors.get("SDF_Color")
+            if vcol_layer:
+                self.report({'INFO'}, "Stage 6: Baking vertex colors to image texture...")
+                scene = context.scene
+                original_engine = scene.render.engine
+                original_bake_settings = {
+                    "use_selected_to_active": scene.render.bake.use_selected_to_active,
+                    "margin": scene.render.bake.margin,
+                    "use_cage": scene.render.bake.use_cage,
+                    "cage_extrusion": scene.render.bake.cage_extrusion,
+                }
+                try:
+                    scene.render.engine = 'CYCLES'
+                    scene.render.bake.use_selected_to_active = False
+                    bpy.ops.object.select_all(action='DESELECT')
+                    context.view_layer.objects.active = final_mesh_object
+                    final_mesh_object.select_set(True)
+                    if self.auto_uv_unwrap or not final_mesh_object.data.uv_layers:
+                        self.report({'INFO'}, "Generating UVs with Smart UV Project...")
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        bpy.ops.mesh.select_all(action='SELECT')
+                        bpy.ops.uv.smart_project(angle_limit=math.radians(66))
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    if not final_mesh_object.data.uv_layers:
+                        self.report({'ERROR'}, "Bake to Texture requires UVs, but none could be found or generated.")
+                        return {'CANCELLED'}
+                    bake_image = bpy.data.images.new(
+                        name=f"{final_mesh_object.name}_Color",
+                        width=self.texture_resolution,
+                        height=self.texture_resolution,
+                        alpha=True
+                    )
+                    if not final_mesh_object.data.materials:
+                        bake_mat = bpy.data.materials.new(name="SDF_Bake_Material")
+                        final_mesh_object.data.materials.append(bake_mat)
+                        bake_mat.use_nodes = True
+                    else:
+                        bake_mat = final_mesh_object.data.materials[0]
+                    tree = bake_mat.node_tree
+                    nodes = tree.nodes
+                    vcol_attr_node = None
+                    for node in nodes:
+                        if node.type == 'ATTRIBUTE' and node.attribute_name == vcol_layer.name:
+                            vcol_attr_node = node
+                            break
+                    if not vcol_attr_node:
+                        vcol_attr_node = nodes.new(type='ShaderNodeAttribute')
+                        vcol_attr_node.attribute_name = vcol_layer.name
+                    emission_node = nodes.new(type='ShaderNodeEmission')
+                    tree.links.new(vcol_attr_node.outputs['Color'], emission_node.inputs['Color'])
+                    bsdf = nodes.get("Principled BSDF")
+                    output_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                    original_link = None
+                    if bsdf and output_node and bsdf.outputs['BSDF'].links:
+                        original_link = bsdf.outputs['BSDF'].links[0]
+                    if output_node:
+                        tree.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
+                    img_node = nodes.new(type='ShaderNodeTexImage')
+                    img_node.image = bake_image
+                    nodes.active = img_node
+                    scene.cycles.bake_type = 'EMIT'
+                    bpy.ops.object.bake(type='EMIT')
+                    resolved_path = bpy.path.abspath(self.texture_path)
+                    if resolved_path and os.path.isdir(resolved_path):
+                        output_dir = resolved_path
+                    else:
+                        self.report({'INFO'}, "No valid path set or blend file is unsaved. Using Desktop as fallback.")
+                        desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+                        output_dir = desktop_dir if os.path.isdir(desktop_dir) else bpy.app.tempdir
+                    os.makedirs(output_dir, exist_ok=True)
+                    filename = f"{final_mesh_object.name}_Color.png"
+                    filepath = os.path.join(output_dir, filename)
+                    self.report({'INFO'}, f"Saved baked texture to: {filepath}")
+                    bake_image.save_render(filepath=filepath)
+                    if original_link:
+                        tree.links.new(original_link.from_socket, original_link.to_socket)
+                    else:
+                        if output_node.inputs['Surface'].links:
+                             tree.links.remove(output_node.inputs['Surface'].links[0])
+                    nodes.remove(emission_node)
+                    if bsdf:
+                        tree.links.new(img_node.outputs['Color'], bsdf.inputs['Base Color'])
+                        if vcol_attr_node not in bsdf.inputs['Base Color'].links:
+                             nodes.remove(vcol_attr_node)
+                    else:
+                        nodes.remove(vcol_attr_node)
+                finally:
+                    self.report({'INFO'}, "Restoring original bake settings.")
+                    scene.render.engine = original_engine
+                    scene.render.bake.use_selected_to_active = original_bake_settings["use_selected_to_active"]
+                    scene.render.bake.margin = original_bake_settings["margin"]
+                    scene.render.bake.use_cage = original_bake_settings["use_cage"]
+                    scene.render.bake.cage_extrusion = original_bake_settings["cage_extrusion"]
 
         if self.shade_smooth and len(final_mesh_object.data.polygons) > 0:
             final_mesh_object.data.polygons.foreach_set('use_smooth', [True] * len(final_mesh_object.data.polygons)); final_mesh_object.data.update()
             
         if self.generate_splats:
-            # Call the simplified function that only needs the source object
             self.create_splat_object(context, final_mesh_object)     
             
         self.report({'INFO'}, "Bake and refinement pipeline completed successfully!")
         return {'FINISHED'}
+    
 
+# In main.py, REPLACE the previous operator with this definitive, correct version.
 
+# In main.py, REPLACE the previous operator with this definitive, correct version.
 
+class OBJECT_OT_sdf_remesh_tools(bpy.types.Operator):
+    """Opens a floating panel that displays Blender's native Remesh UI by drawing its properties directly."""
+    bl_idname = "object.sdf_remesh_tools"
+    bl_label = "Remesh Tools"
+    bl_options = {'REGISTER'}
+    
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=350)
+    
+    def draw(self, context):
+        layout = self.layout
+        mesh = context.object.data
+        layout.use_property_split = True
+        
+        # Draw the mode selector
+        layout.prop(mesh, "remesh_mode", expand=True)
+        box = layout.box()
+        
+        if mesh.remesh_mode == 'VOXEL':
+            col = box.column()
+            col.label(text="Voxel Remesh", icon='MOD_REMESH')
+            # Use correct property names with remesh_ prefix
+            col.prop(mesh, "remesh_voxel_size")
+            col.prop(mesh, "remesh_voxel_adaptivity")
+            col.prop(mesh, "use_remesh_fix_poles")
+            col.prop(mesh, "use_remesh_preserve_volume")
+            col.prop(mesh, "use_remesh_preserve_attributes")
+            col.prop(mesh, "use_remesh_smooth_shade")
+            col.operator("object.voxel_remesh", text="Voxel Remesh", icon='MOD_REMESH')
+            
+        elif mesh.remesh_mode == 'QUAD':
+            col = box.column()
+            col.label(text="QuadriFlow Remesh", icon='MOD_REMESH')
+            # Use correct QuadriFlow property names
+            col.prop(mesh, "remesh_quadri_flow_mode", text="Mode")
+            col.prop(mesh, "remesh_quadri_flow_target_faces", text="Target Faces")
+            col.prop(mesh, "remesh_quadri_flow_seed", text="Seed")
+            
+            # Fixed: Check if property exists before accessing it
+            row = col.row()
+            if hasattr(mesh, "use_remesh_quadri_flow_mesh_symmetry"):
+                row.enabled = mesh.use_remesh_quadri_flow_mesh_symmetry
+                row.prop(mesh, "use_remesh_quadri_flow_mesh_symmetry", text="Mesh Symmetry")
+            else:
+                row.label(text="Mesh Symmetry (not available in this Blender version)")
+            
+            col.prop(mesh, "use_remesh_quadri_flow_face_count", text="Target Face Count")
+            col.prop(mesh, "use_remesh_quadri_flow_smooth_normals", text="Smooth Normals")
+            col.operator("object.quadriflow_remesh", text="QuadriFlow Remesh", icon='MOD_REMESH')
+        
+        elif mesh.remesh_mode == 'MESHCLEAN':
+            col = box.column()
+            col.label(text="Blocks Remesh", icon='MOD_REMESH')
+            # Blocks remesh properties would go here
+
+    def execute(self, context):
+        # This operator's job is only to show the panel.
+        # The buttons inside the panel do the real work.
+        return {'FINISHED'}
 
 class OBJECT_OT_sdf_bake_to_remesh(bpy.types.Operator):
     """Sets up the scene for a 'Selected to Active' bake and opens the Bake Panel.
@@ -2660,6 +2673,11 @@ class SDFPrototyperPanel(bpy.types.Panel):
         op_solid.mode = 'SOLID'
         op_points = row.operator(PROTOTYPER_OT_SDFSetPointCloudPreview.bl_idname, text="All Points")
         op_points.mode = 'POINTS'
+        if scene.sdf_shader_view:
+            ray_box = preview_box.box()
+            ray_box.label(text="Ray March Performance")
+            ray_box.prop(scene, "sdf_raymarch_max_steps")
+            ray_box.prop(scene, "sdf_pixelation_amount")
         res_box = layout.box()
         res_box.label(text="Domain Settings", icon='OBJECT_DATA')
         res_col = res_box.column(align=True)
@@ -2765,7 +2783,7 @@ class SDFPrototyperPanel(bpy.types.Panel):
                             sc2.prop(item, "blend_strength", text="Strength")
                             sc2.prop(item, "blend", text="Smoothness")
                         elif item.operation == 'MASK':
-                            sc2.prop(item, "blend_strength", text="Shell Thickness")
+                            #sc2.prop(item, "blend_strength", text="Shell Thickness")
                             sc2.prop(item, "blend", text="Edge Smoothness")
                         elif item.operation == 'PAINT':
                              sc2.prop(item, "blend_strength", text="Feather")
@@ -2897,8 +2915,9 @@ class SDFPrototyperPanel(bpy.types.Panel):
 
         act_col.separator()
         act_col.operator(OBJECT_OT_sdf_auto_uv.bl_idname, text="Auto UV Selected", icon='UV_DATA')
+        # --- NEW BUTTON ADDED HERE ---
+        act_col.operator(OBJECT_OT_sdf_remesh_tools.bl_idname, text="Open Remesh Tools", icon='MOD_REMESH')
         act_col.operator(OBJECT_OT_sdf_snap_selection_to_active.bl_idname, text="Snap Selection to Active", icon='SNAP_ON')
-
 
         act_col.separator()
         act_col.operator("prototyper.sdf_bake_symmetry", text="Bake Active Symmetries", icon='CHECKMARK')
@@ -3448,49 +3467,65 @@ class PROTOTYPER_OT_SDFRepeatShape(bpy.types.Operator):
         original_node = next((n for n in node_tree.nodes if n.get("associated_empty") == original_empty.name), None)
         if not original_node: return {'CANCELLED'}
 
-        bpy.ops.object.select_all(action='DESELECT')
-        context.view_layer.objects.active = None
-        
-        created_empties = []
+        # --- PERFORMANCE FIX: Find the modifier and prepare to disable it ---
+        mod = next((m for m in domain_obj.modifiers if m.type == 'NODES'), None)
+        if mod:
+            # This line disables the modifier in the viewport, pausing calculations.
+            mod.show_viewport = False
+        # --- END FIX ---
 
-        # --- LINEAR MODE ---
-        if self.repeat_mode == 'LINEAR':
-            direction_vec = Vector(self.linear_direction)
-            final_offset = direction_vec.normalized() * self.linear_spacing if direction_vec.length > 0 else Vector()
-            for i in range(self.linear_count):
-                new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Repeat.{i+1}")
-                new_empty = new_sdf["empty"]
-                new_empty.location = original_empty.location + (final_offset * (i + 1))
-                created_empties.append(new_empty)
-
-        # --- RADIAL MODE (Simplified) ---
-        elif self.repeat_mode == 'RADIAL':
-            pivot_point = context.scene.cursor.location
-            angle_step = (2 * math.pi) / self.radial_count
+        # The try...finally block guarantees the modifier is re-enabled, even if an error occurs.
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            context.view_layer.objects.active = None
             
-            pivot_mat = Matrix.Translation(pivot_point)
-            pivot_inv_mat = Matrix.Translation(-pivot_point)
+            created_empties = []
 
-            for i in range(1, self.radial_count):
-                new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Radial.{i}")
-                new_empty = new_sdf["empty"]
+            # --- LINEAR MODE (Your original code is unchanged here) ---
+            if self.repeat_mode == 'LINEAR':
+                direction_vec = Vector(self.linear_direction)
+                final_offset = direction_vec.normalized() * self.linear_spacing if direction_vec.length > 0 else Vector()
+                for i in range(self.linear_count):
+                    new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Repeat.{i+1}")
+                    new_empty = new_sdf["empty"]
+                    new_empty.location = original_empty.location + (final_offset * (i + 1))
+                    created_empties.append(new_empty)
 
-                rot_mat = Matrix.Rotation(angle_step * i, 4, self.radial_axis)
+            # --- RADIAL MODE (Your original code is unchanged here) ---
+            elif self.repeat_mode == 'RADIAL':
+                pivot_point = context.scene.cursor.location
+                angle_step = (2 * math.pi) / self.radial_count
                 
-                new_empty.matrix_world = pivot_mat @ rot_mat @ pivot_inv_mat @ original_empty.matrix_world
+                pivot_mat = Matrix.Translation(pivot_point)
+                pivot_inv_mat = Matrix.Translation(-pivot_point)
 
-                # --- Mirroring logic removed ---
+                for i in range(1, self.radial_count):
+                    new_sdf = _clone_sdf_hierarchy(context, original_item, original_node, new_name_suffix=f".Radial.{i}")
+                    new_empty = new_sdf["empty"]
 
-                created_empties.append(new_empty)
+                    rot_mat = Matrix.Rotation(angle_step * i, 4, self.radial_axis)
+                    
+                    new_empty.matrix_world = pivot_mat @ rot_mat @ pivot_inv_mat @ original_empty.matrix_world
 
-        rewire_full_sdf_chain(context)
-        
-        if created_empties:
-            for empty in created_empties:
-                empty.select_set(True)
-            context.view_layer.objects.active = created_empties[-1]
+                    created_empties.append(new_empty)
 
-        self.report({'INFO'}, f"Created {len(created_empties)} repeated shapes.")
+            # This is now safe and fast because the modifier is disabled.
+            rewire_full_sdf_chain(context)
+            
+            if created_empties:
+                for empty in created_empties:
+                    empty.select_set(True)
+                context.view_layer.objects.active = created_empties[-1]
+
+            self.report({'INFO'}, f"Created {len(created_empties)} repeated shapes.")
+
+        finally:
+            # --- PERFORMANCE FIX: This block ALWAYS runs, re-enabling the modifier ---
+            if mod:
+                # This line turns the modifier back on, triggering a single, final calculation.
+                mod.show_viewport = True
+            # --- END FIX ---
+
         return {'FINISHED'}
     
 #--------------------------------------------------------------------    
@@ -4685,12 +4720,14 @@ class SDFNodeItem(PropertyGroup):
     blend_type: EnumProperty(
         name="Blend Type",
         items=[
-            ('ROUND', "Round", "Creates a soft, G2-continuous rounded blend"),
-            ('CHAMFER', "Chamfer", "Creates a hard, 45-degree linear blend")
+            ('ROUND', "Round", "Creates a soft, convex rounded blend"),
+            ('CHAMFER', "Chamfer", "Creates a hard, 45-degree linear blend"),
+            ('GROOVE', "Groove", "Creates a soft, concave (inverted) rounded blend"),
+            ('PIPE', "Pipe", "Creates a convex bead along the intersection")
         ],
         default='ROUND',
         update=_redraw_shader_view
-    )  
+    ) 
     
     # --- THIS IS YOUR UPDATED PROPERTY ---
     blend: FloatProperty(
@@ -4866,8 +4903,10 @@ _classes = [
     OBJECT_OT_sdf_bake_to_remesh,
     OBJECT_OT_sdf_auto_uv,                    
     OBJECT_OT_sdf_snap_selection_to_active, 
+    # --- THIS IS THE ONLY CHANGE: Using the new, correct operator ---
+    OBJECT_OT_sdf_remesh_tools,
 
-    # Add SDF Shape Operators
+    # Add SDF Shape Operators (YOUR FULL LIST IS PRESERVED)
     SDFCubeAdd, SDFCylinderAdd, SDFUVSphereAdd, SDFConeAdd,
     SDFPrismAdd, SDFTorusAdd, SDFCurveAdd, SDFMeshAdd, SDFSculptAdd,
     SDFMeshToSDF,
@@ -4941,6 +4980,20 @@ def register():
         name="Max Shapes",
         description="Shader shape limit. High values require a powerful GPU. Change requires restart",
         default=32, min=8, max=2048, step=4 
+    )
+    Scene.sdf_raymarch_max_steps = bpy.props.IntProperty(
+        name="Max Ray Steps",
+        description="Maximum steps for the raymarcher. Lower is faster but has a shorter render distance",
+        default=128, 
+        min=1, # <-- Change this value from 16 to 1
+        max=512,
+        update=_redraw_shader_view
+    )
+    Scene.sdf_pixelation_amount = bpy.props.IntProperty(
+        name="Pixelation",
+        description="Increases the size of pixel blocks for a stylized, faster preview. 1 = Off",
+        default=1, min=1, max=32,
+        update=_redraw_shader_view
     )
     Scene.lock_sdf_panel               = bpy.props.BoolProperty(name="Lock SDF Panel", default=False, update=update_lock)
     Scene.locked_sdf_object            = bpy.props.PointerProperty(type=bpy.types.Object)
@@ -5091,7 +5144,10 @@ def unregister():
         "sdf_shape_tab", "sdf_shader_view", "sdf_global_tint",
         "sdf_light_azimuth", "sdf_light_elevation", "sdf_color_blend_mode",
         "sdf_visualization_mode",
-        "sdf_view_mode" # <-- ADD THIS LINE
+        "sdf_view_mode",
+        "sdf_raymarch_max_steps",
+        "sdf_pixelation_amount"
+        
     ]
     for p in props_to_del:
         if hasattr(Scene, p):
