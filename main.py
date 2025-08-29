@@ -1328,20 +1328,13 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         items=[
             ('DIRECT', "Direct (PyMCubes)", "Fast, colored, but memory-intensive. Best for lower resolutions."),
             ('VDB', "VDB (Geometry Only)", "Memory-efficient, high-resolution, but produces an uncolored mesh."),
-            ('HYBRID', "Hybrid (VDB + Color)", "Memory-efficient, high-resolution, and colored. Slower due to a second color-baking pass."),
-            ('ADAPTIVE', "Adaptive (High-Res Color)", "Memory-efficient method for very high resolutions with full color support.")
+            ('HYBRID', "Hybrid (VDB + Color)", "Memory-efficient, high-resolution, and colored. Slower due to a second color-baking pass.")
         ],
         default='DIRECT'
     )
-    bake_colors: bpy.props.BoolProperty(name="Bake Vertex Colors",description="Export color information to the baked mesh. Not applicable for VDB method.",default=True)
+    bake_colors: bpy.props.BoolProperty(name="Bake Vertex Colors",description="Export color information to the baked mesh. Only for Direct method.",default=True)
     direct_method_smoothing: bpy.props.BoolProperty(name="Smooth Voxel Data",description="Pre-smooth the voxel data before meshing. Improves quality but is slower. Only for Direct method.",default=True)
-    res: bpy.props.IntProperty(name="Initial Resolution", description="The resolution for the initial 'scout' scan in Adaptive mode, or the final resolution for other modes.", default=256, min=32, max=4096)
-    
-    # --- Adaptive Properties ---
-    adaptive_final_resolution: bpy.props.IntProperty(name="Final Resolution", description="The target high resolution for the adaptive bake", default=1024, min=256, max=8192)
-    adaptive_tile_size: bpy.props.IntProperty(name="Tile Size", description="The size of each high-res patch. Smaller is less memory-intensive but may be slower", default=64, min=16, max=256)
-    adaptive_threshold: bpy.props.FloatProperty(name="Surface Threshold", description="How far from the surface to scan for high-detail patches. Higher values are safer but slower", default=0.1, min=0.01, max=1.0)
-
+    res: bpy.props.IntProperty(name="Initial Resolution", default=256, min=32, max=4096)
     bake_scale: bpy.props.FloatProperty(name="Bake Scale", default=1.0, min=0.1, max=10.0)
     vdb_filepath: bpy.props.StringProperty(name="VDB File Path", default=os.path.expanduser("~/Desktop/sdf_bake.vdb"), subtype='FILE_PATH')
     
@@ -1350,10 +1343,10 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
     auto_uv_unwrap: bpy.props.BoolProperty(name="Auto UV Unwrap", default=True)
     texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=256, max=4096)
 
-    # --- Retopology & Polish Properties ---
+    # --- Retopology & Polish Properties (QUADRIFLOW REMOVED) ---
     retopology_method: bpy.props.EnumProperty(name="Retopology Method", items=[('NONE', "None", ""), ('VOXEL', "Voxel Remesh", "")], default='NONE')
     
-    # --- Voxel Properties ---
+    # --- Full Voxel Properties ---
     voxel_remesh_size: bpy.props.FloatProperty(name="Voxel Size", default=0.01, min=0.001, max=1.0, precision=4)
     voxel_remesh_adaptivity: bpy.props.FloatProperty(name="Adaptivity", default=0.0, min=0.0, max=1.0)
     voxel_fix_poles: bpy.props.BoolProperty(name="Fix Poles", default=False)
@@ -1404,19 +1397,7 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
             else:
                 sub = col.box()
                 sub.prop(self, "vdb_filepath", text="VDB Path")
-        elif self.bake_method == 'ADAPTIVE':
-            if not HAS_MCUBES: col.label(text="PyMCubes library not found!", icon='ERROR')
-            else:
-                sub = col.box()
-                sub.prop(self, "bake_colors")
-                sub.separator()
-                sub.label(text="Adaptive Quality:")
-                sub.prop(self, "adaptive_final_resolution")
-                sub.separator()
-                sub.label(text="Performance vs. Memory:")
-                sub.prop(self, "adaptive_tile_size")
-                sub.prop(self, "adaptive_threshold")
-
+        
         col.prop(self, "res")
         col.prop(self, "bake_scale")
         
@@ -1432,6 +1413,8 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
             sub.prop(self, "voxel_preserve_volume")
             sub.prop(self, "voxel_preserve_attributes")
             
+        # QUADRIFLOW UI IS REMOVED
+            
         box = layout.box(); box.label(text="Stage 3: Final Polishing", icon='MOD_SMOOTH')
         col = box.column()
         col.prop(self, "add_subdivision_modifier")
@@ -1444,7 +1427,7 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         col.separator()
         col.prop(self, "shade_smooth")
 
-        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID') or (self.bake_method == 'ADAPTIVE' and self.bake_colors):
+        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
             tex_box = layout.box()
             tex_box.label(text="Stage 4: Texture Output", icon='TEXTURE')
             tex_box.prop(self, "bake_to_texture")
@@ -1454,6 +1437,7 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 sub_tex.prop(self, "texture_resolution", text="Resolution")
                 sub_tex.prop(self, "texture_path")
            
+        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
             splat_box = layout.box()
             splat_box.label(text="Stage 5: Splat Generation", icon='PARTICLES')
             splat_box.prop(self, "generate_splats")
@@ -1472,16 +1456,15 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 row.prop(self, "splat_height_max", text="Max Height")
 
     def create_splat_object(self, context, source_object):
+        # ... (your existing splat code is unchanged)
         self.report({'INFO'}, "Generating live particle system for splats...")
         if "Splat_Instances" in bpy.data.collections:
             splat_collection = bpy.data.collections["Splat_Instances"]
         else:
             splat_collection = bpy.data.collections.new("Splat_Instances")
             context.scene.collection.children.link(splat_collection)
-        
-        context.view_layer.layer_collection.children[splat_collection.name].hide_viewport = False
+        context.view_layer.layer_collection.children[splat_collection.name].hide_viewport = True
         context.view_layer.layer_collection.children[splat_collection.name].exclude = False
-
         shape_name = f"Splat_{self.splat_shape.title()}"
         if shape_name not in splat_collection.objects:
             if self.splat_shape == 'SQUARE':
@@ -1492,14 +1475,11 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 bpy.ops.mesh.primitive_circle_add(vertices=3, fill_type='NGON')
             splat_instance = context.active_object
             splat_instance.name = shape_name
-            for coll in splat_instance.users_collection:
-                coll.objects.unlink(splat_instance)
             splat_collection.objects.link(splat_instance)
-
+            context.collection.objects.unlink(splat_instance)
         bpy.ops.object.select_all(action='DESELECT')
         context.view_layer.objects.active = source_object
         source_object.select_set(True)
-        
         bpy.ops.object.particle_system_add()
         psys = source_object.particle_systems[-1]
         psys.name = "SplatParticleSystem"
@@ -1507,38 +1487,36 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         psettings.type = 'HAIR'
         psettings.use_advanced_hair = True
         psettings.emit_from = 'FACE'
-        
         surface_area = sum(f.area for f in source_object.data.polygons)
         particle_count = int(self.splat_density * surface_area)
         if particle_count == 0 and surface_area > 0:
             particle_count = 1
         self.report({'INFO'}, f"Calculated Surface Area: {surface_area:.4f} m^2. Creating {particle_count} splats.")
-        
         psettings.count = particle_count
         psettings.render_type = 'COLLECTION'
         psettings.instance_collection = splat_collection
         psettings.particle_size = self.splat_size_min
         psettings.size_random = (self.splat_size_max - self.splat_size_min) / self.splat_size_min if self.splat_size_min > 0 else 1.0
-        
-        psys.show_instancer_for_render = True
         psys.show_instancer_for_viewport = True
-
         psettings.use_rotations = True
         psettings.rotation_mode = 'NOR_TAN'
         psettings.phase_factor = self.splat_rotation_min / (math.pi * 2)
         psettings.phase_factor_random = (self.splat_rotation_max - self.splat_rotation_min) / (math.pi * 2)
-        
+        psettings.physics_type = 'NEWTON'
+        psettings.normal_factor = (self.splat_height_min + self.splat_height_max) / 2.0
+        bpy.ops.object.select_all(action='DESELECT')
+        context.view_layer.objects.active = source_object
+        source_object.select_set(True)
         self.report({'INFO'}, "Successfully added a live splat particle system.")
         
     def execute(self, context):
         # ... (Initial checks and setup code is unchanged) ...
-        if self.bake_method in {'DIRECT', 'ADAPTIVE'} and not HAS_MCUBES:
-            self.report({'ERROR'}, "PyMCubes library is required for this method.")
+        if self.bake_method == 'DIRECT' and not HAS_MCUBES:
+            self.report({'ERROR'}, "PyMCubes library is required for the Direct method.")
             return {'CANCELLED'}
         if self.bake_method in {'VDB', 'HYBRID'} and not HAS_OPENVDB:
             self.report({'ERROR'}, "pyopenvdb library is required for VDB/Hybrid methods.")
             return {'CANCELLED'}
-
         domain = getattr(context.scene, "sdf_domain", None)
         if not domain: self.report({'ERROR'}, "SDF Domain object not found."); return {'CANCELLED'}
         self.report({'INFO'}, f"Preparing bake with '{self.bake_method}' method...")
@@ -1548,13 +1526,12 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
         final_size = base_size * self.bake_scale; final_min = base_center - (final_size / 2.0); final_max = base_center + (final_size / 2.0)
         longest_axis = max(final_size)
         if longest_axis <= 0: return {'CANCELLED'}
-        
+        voxel_size = longest_axis / self.res
+        res_x, res_y, res_z = [max(16, int(s / voxel_size)) for s in final_size]
         final_mesh_object = None
-        
-        # --- MESH GENERATION STAGE ---
+        col_r_grid, col_g_grid, col_b_grid = (None, None, None)
+
         if self.bake_method == 'DIRECT':
-            voxel_size = longest_axis / self.res
-            res_x, res_y, res_z = [max(16, int(s / voxel_size)) for s in final_size]
             try:
                 density_grid, col_r_grid, col_g_grid, col_b_grid = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
             except Exception as e: 
@@ -1562,137 +1539,119 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
             self.report({'INFO'}, "Stage 2: Generating Mesh via Marching Cubes...")
             mesh_density_grid = mcubes.smooth(density_grid) if self.direct_method_smoothing else density_grid
             verts, faces = mcubes.marching_cubes(mesh_density_grid, 0.0)
-            if len(verts) == 0: 
-                self.report({'WARNING'}, "Bake resulted in an empty mesh. Check Bake Scale or shape positions.")
-                return {'CANCELLED'}
+            if len(verts) == 0: self.report({'WARNING'}, "Bake resulted in an empty mesh."); return {'CANCELLED'}
             verts_np = np.array(verts)
             verts_np[:, [0, 1, 2]] = verts_np[:, [2, 1, 0]]
             verts_world = (verts_np * voxel_size) + np.array(final_min)
             mesh_data = bpy.data.meshes.new("SDF_Mesh_Data"); mesh_data.from_pydata(verts_world.tolist(), [], faces.tolist()); mesh_data.update()
             final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", mesh_data); context.collection.objects.link(final_mesh_object)
-
         elif self.bake_method in {'VDB', 'HYBRID'}:
-            # ... (VDB/Hybrid logic is unchanged) ...
-            pass
-
-        elif self.bake_method == 'ADAPTIVE':
-            self.report({'INFO'}, "Stage 1: Performing low-resolution scan...")
-            low_res_voxel_size = longest_axis / self.res
-            low_res_dims = [max(16, int(s / low_res_voxel_size)) for s in final_size]
             try:
-                scout_grid, _, _, _ = render_sdf_slices(low_res_dims[0], low_res_dims[1], low_res_dims[2], final_min, final_max)
-            except Exception as e:
-                self.report({'ERROR'}, f"Adaptive bake failed during scout pass: {e}"); return {'CANCELLED'}
-            
-            self.report({'INFO'}, "Stage 2: Analyzing scout grid for surface areas...")
-            
-            near_surface_mask = np.abs(scout_grid) < self.adaptive_threshold
-            sign_change_mask = np.zeros_like(scout_grid, dtype=bool)
-            sign_change_mask[:-1, :, :] |= (np.sign(scout_grid[:-1, :, :]) != np.sign(scout_grid[1:, :, :]))
-            sign_change_mask[:, :-1, :] |= (np.sign(scout_grid[:, :-1, :]) != np.sign(scout_grid[:, 1:, :]))
-            sign_change_mask[:, :, :-1] |= (np.sign(scout_grid[:, :, :-1]) != np.sign(scout_grid[:, :, 1:]))
-            
-            combined_mask = near_surface_mask | sign_change_mask
-            surface_voxels = np.argwhere(combined_mask)
-            
-            if len(surface_voxels) == 0:
-                self.report({'WARNING'}, "Adaptive bake found no surface. Try increasing Bake Scale or Initial Resolution."); return {'CANCELLED'}
-
-            self.report({'INFO'}, f"Found {len(surface_voxels)} surface voxels. Generating high-res tiles...")
-            
-            high_res_voxel_size = longest_axis / self.adaptive_final_resolution
-            scale_factor = self.adaptive_final_resolution / self.res
-            tile_size_hr = self.adaptive_tile_size
-
-            all_verts, all_faces, all_colors = [], [], []
-            
-            tile_origins_hr = set()
-            for lz, ly, lx in surface_voxels:
-                hx, hy, hz = lx * scale_factor, ly * scale_factor, lz * scale_factor
-                tile_origins_hr.add((int(hx // tile_size_hr) * tile_size_hr, int(hy // tile_size_hr) * tile_size_hr, int(hz // tile_size_hr) * tile_size_hr))
-
-            total_tiles = len(tile_origins_hr)
-            for i, (hox, hoy, hoz) in enumerate(tile_origins_hr):
-                self.report({'INFO'}, f"Processing tile {i+1} of {total_tiles}...")
-                
-                tile_min_v = Vector((hox, hoy, hoz)) * high_res_voxel_size + final_min
-                tile_max_v = Vector((hox + tile_size_hr, hoy + tile_size_hr, hoz + tile_size_hr)) * high_res_voxel_size + final_min
-                
-                try:
-                    tile_grid, r_grid, g_grid, b_grid = render_sdf_slices(tile_size_hr, tile_size_hr, tile_size_hr, tile_min_v, tile_max_v)
-                except Exception as e:
-                    self.report({'WARNING'}, f"Skipping tile due to render error: {e}"); continue
-
-                verts, faces = mcubes.marching_cubes(tile_grid, 0.0)
-                if len(verts) > 0:
-                    verts_np = np.array(verts)
-                    verts_np[:, [0, 1, 2]] = verts_np[:, [2, 1, 0]]
-                    
-                    verts_world = (verts_np * high_res_voxel_size) + np.array(tile_min_v)
-                    
-                    face_offset = len(all_verts)
-                    all_verts.extend(verts_world.tolist())
-                    all_faces.extend((faces + face_offset).tolist())
-
-                    if self.bake_colors:
-                        verts_voxel_tile = (verts_world - np.array(tile_min_v)) / high_res_voxel_size
-                        colors_r = trilinear_interpolate(r_grid, verts_voxel_tile)
-                        colors_g = trilinear_interpolate(g_grid, verts_voxel_tile)
-                        colors_b = trilinear_interpolate(b_grid, verts_voxel_tile)
-                        colors_patch = np.stack((colors_r, colors_g, colors_b, np.ones_like(colors_r)), axis=-1)
-                        all_colors.append(colors_patch)
-
-            if not all_verts: self.report({'WARNING'}, "Adaptive bake resulted in an empty mesh."); return {'CANCELLED'}
-            
-            mesh_data = bpy.data.meshes.new("SDF_Mesh_Data_Adaptive")
-            mesh_data.from_pydata(all_verts, [], all_faces)
-            mesh_data.validate()
-            mesh_data.update()
-            
-            final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result_Adaptive", mesh_data)
-            context.collection.objects.link(final_mesh_object)
-            context.view_layer.objects.active = final_mesh_object
-            
-            if self.bake_colors and all_colors:
-                vcol_layer = final_mesh_object.data.vertex_colors.new(name="SDF_Color")
-                combined_colors = np.concatenate(all_colors, axis=0)
-                loop_vert_indices = np.zeros(len(final_mesh_object.data.loops), dtype=np.int32)
-                final_mesh_object.data.loops.foreach_get('vertex_index', loop_vert_indices)
-                vcol_layer.data.foreach_set('color', combined_colors[loop_vert_indices].ravel())
-
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.mesh.remove_doubles(threshold=high_res_voxel_size * 0.5)
-            bpy.ops.object.mode_set(mode='OBJECT')
+                density_grid, _, _, _ = render_sdf_slices(res_x, res_y, res_z, final_min, final_max)
+            except Exception as e: self.report({'ERROR'}, f"Stage 1 failed during GPU rendering: {e}"); return {'CANCELLED'}
+            self.report({'INFO'}, "Stage 2: Writing VDB and converting to Mesh...")
+            try:
+                vdb_path = bpy.path.abspath(self.vdb_filepath); os.makedirs(os.path.dirname(vdb_path), exist_ok=True)
+                write_vdb(density_grid, vdb_path, final_min, voxel_size)
+                bpy.ops.object.volume_import(filepath=vdb_path, align='WORLD', location=(0,0,0))
+                volume_object = context.view_layer.objects.active; volume_object.name = "SDF_Volume_Source"
+            except Exception as e: self.report({'ERROR'}, f"Stage 2 (VDB) failed: {e}"); return {'CANCELLED'}
+            final_mesh_object = bpy.data.objects.new("SDF_Mesh_Result", bpy.data.meshes.new("SDF_Mesh_Data")); context.collection.objects.link(final_mesh_object)
+            mod_v2m = final_mesh_object.modifiers.new(name="VolumeToMesh", type='VOLUME_TO_MESH'); mod_v2m.object = volume_object; mod_v2m.threshold = 0.0
+            depsgraph = context.evaluated_depsgraph_get(); object_eval = final_mesh_object.evaluated_get(depsgraph)
+            mesh_from_eval = bpy.data.meshes.new_from_object(object_eval); final_mesh_object.data = mesh_from_eval
+            final_mesh_object.modifiers.clear(); bpy.data.objects.remove(volume_object, do_unlink=True)
 
         if not final_mesh_object: self.report({'ERROR'}, "Mesh object was not created. Aborting."); return {'CANCELLED'}
         bpy.ops.object.select_all(action='DESELECT'); context.view_layer.objects.active = final_mesh_object; final_mesh_object.select_set(True)
         
-        # --- POST-PROCESSING STAGES ---
-        
-        if (self.bake_method == 'DIRECT' and self.bake_colors) or self.bake_method == 'HYBRID':
-            # ... (logic for direct/hybrid color application) ...
-            pass
+        vcol_layer = None
+        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID'):
+            self.report({'INFO'}, "Stage 3: Applying vertex colors to initial mesh...")
+            if self.bake_method == 'HYBRID':
+                self.report({'INFO'}, "Using memory-efficient slice-by-slice color sampling...")
+                mw = final_mesh_object.matrix_world
+                final_verts_count = len(final_mesh_object.data.vertices)
+                final_verts_local = np.empty(final_verts_count * 3, dtype=np.float32)
+                final_mesh_object.data.vertices.foreach_get('co', final_verts_local)
+                final_verts_local = final_verts_local.reshape((final_verts_count, 3))
+                final_verts_world = np.einsum('ij,aj->ai', np.array(mw), np.hstack((final_verts_local, np.ones((final_verts_count, 1)))))[:, :3]
+                final_verts_voxel = (final_verts_world - np.array(final_min)) / voxel_size
+                offscreen, slice_shader, slice_batch = setup_slice_baking(res_x, res_y)
+                vert_colors = np.zeros((final_verts_count, 4), dtype=np.float32)
+                with offscreen.bind():
+                    gpu.state.viewport_set(0, 0, res_x, res_y)
+                    slice_shader.bind()
+                    slice_shader.uniform_float("uBoundsMin", final_min)
+                    slice_shader.uniform_float("uBoundsMax", final_max)
+                    slice_shader.uniform_int("uDepth", res_z)
+                    framebuffer = gpu.state.active_framebuffer_get()
+                    for z in range(res_z):
+                        indices_in_slice = np.where((final_verts_voxel[:, 2] >= z) & (final_verts_voxel[:, 2] < z + 1))[0]
+                        if len(indices_in_slice) == 0: continue
+                        slice_shader.uniform_int("uSliceIndex", z)
+                        slice_batch.draw(slice_shader)
+                        pixel_buffer = framebuffer.read_color(0, 0, res_x, res_y, 4, 0, 'FLOAT')
+                        slice_arr = np.array(pixel_buffer.to_list(), dtype=np.float32).reshape(res_y, res_x, 4)
+                        points_in_slice = final_verts_voxel[indices_in_slice][:, :2]
+                        sampled_data = bilinear_interpolate(slice_arr, points_in_slice)
+                        vert_colors[indices_in_slice, 0] = sampled_data[:, 1]
+                        vert_colors[indices_in_slice, 1] = sampled_data[:, 2]
+                        vert_colors[indices_in_slice, 2] = sampled_data[:, 3]
+                        vert_colors[indices_in_slice, 3] = 1.0
+                offscreen.free()
+                colors_flat = vert_colors
+            else: # Direct Mode
+                mw = final_mesh_object.matrix_world
+                final_verts_count = len(final_mesh_object.data.vertices)
+                final_verts_local = np.empty(final_verts_count * 3, dtype=np.float32)
+                final_mesh_object.data.vertices.foreach_get('co', final_verts_local)
+                final_verts_local = final_verts_local.reshape((final_verts_count, 3))
+                final_verts_world = np.einsum('ij,aj->ai', np.array(mw), np.hstack((final_verts_local, np.ones((final_verts_count, 1)))))[:, :3]
+                final_verts_voxel = (final_verts_world - np.array(final_min)) / voxel_size
+                vert_colors_r = trilinear_interpolate(col_r_grid, final_verts_voxel)
+                vert_colors_g = trilinear_interpolate(col_g_grid, final_verts_voxel)
+                vert_colors_b = trilinear_interpolate(col_b_grid, final_verts_voxel)
+                colors_flat = np.stack((vert_colors_r, vert_colors_g, vert_colors_b, np.ones_like(vert_colors_r)), axis=-1)
+            
+            vcol_layer = final_mesh_object.data.vertex_colors.new(name="SDF_Color")
+            loop_vert_indices = np.zeros(len(final_mesh_object.data.loops), dtype=np.int32)
+            final_mesh_object.data.loops.foreach_get('vertex_index', loop_vert_indices)
+            vcol_layer.data.foreach_set('color', colors_flat[loop_vert_indices].ravel())
+            
+            temp_mat = bpy.data.materials.new(name="SDF_VCol_Display")
+            temp_mat.use_nodes = True
+            nodes = temp_mat.node_tree.nodes
+            bsdf = nodes.get("Principled BSDF")
+            if bsdf:
+                attr_node = nodes.new(type='ShaderNodeAttribute')
+                attr_node.attribute_name = vcol_layer.name
+                temp_mat.node_tree.links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
+            final_mesh_object.data.materials.append(temp_mat)
 
-        if (self.bake_method == 'DIRECT' and self.bake_colors) or (self.bake_method == 'HYBRID') or (self.bake_method == 'ADAPTIVE' and self.bake_colors):
-            vcol_layer = final_mesh_object.data.vertex_colors.get("SDF_Color")
-            if vcol_layer:
-                temp_mat = bpy.data.materials.new(name="SDF_VCol_Display")
-                temp_mat.use_nodes = True
-                nodes = temp_mat.node_tree.nodes
-                bsdf = nodes.get("Principled BSDF")
-                if bsdf:
-                    attr_node = nodes.new(type='ShaderNodeAttribute')
-                    attr_node.attribute_name = vcol_layer.name
-                    temp_mat.node_tree.links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
-                final_mesh_object.data.materials.append(temp_mat)
-        
+        # --- Retopology Logic (QUADRIFLOW REMOVED) ---
         if self.retopology_method == 'VOXEL':
-            # ... (voxel remesh logic) ...
-            pass
+            self.report({'INFO'}, "Stage 4: Applying Voxel Remesh...")
+            mesh_data = final_mesh_object.data
+            mesh_data.remesh_voxel_size = self.voxel_remesh_size
+            mesh_data.remesh_voxel_adaptivity = self.voxel_remesh_adaptivity
+            mesh_data.use_remesh_fix_poles = self.voxel_fix_poles
+            mesh_data.use_remesh_preserve_volume = self.voxel_preserve_volume
+            mesh_data.use_remesh_preserve_attributes = self.voxel_preserve_attributes
+            bpy.ops.object.voxel_remesh()
         
-        # ... (polishing modifiers logic) ...
-        pass
+        self.report({'INFO'}, "Stage 5: Applying Final Polish...")
+        if self.add_subdivision_modifier:
+            bpy.ops.object.modifier_add(type='SUBSURF'); mod = final_mesh_object.modifiers[-1]
+            mod.levels = self.subdivision_levels; mod.render_levels = self.subdivision_levels
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        if self.add_smooth_modifier:
+            bpy.ops.object.modifier_add(type='SMOOTH'); mod = final_mesh_object.modifiers[-1]
+            mod.factor = self.smooth_factor; mod.iterations = self.smooth_iterations
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+        if self.add_corrective_smooth_modifier:
+            bpy.ops.object.modifier_add(type='CORRECTIVE_SMOOTH')
+            bpy.ops.object.modifier_apply(modifier=final_mesh_object.modifiers[-1].name)
 
         if self.bake_to_texture and final_mesh_object.data.vertex_colors:
             vcol_layer = final_mesh_object.data.vertex_colors.get("SDF_Color")
@@ -1700,7 +1659,12 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                 self.report({'INFO'}, "Stage 6: Baking vertex colors to image texture...")
                 scene = context.scene
                 original_engine = scene.render.engine
-                original_bake_settings = { "use_selected_to_active": scene.render.bake.use_selected_to_active, "margin": scene.render.bake.margin, "use_cage": scene.render.bake.use_cage, "cage_extrusion": scene.render.bake.cage_extrusion }
+                original_bake_settings = {
+                    "use_selected_to_active": scene.render.bake.use_selected_to_active,
+                    "margin": scene.render.bake.margin,
+                    "use_cage": scene.render.bake.use_cage,
+                    "cage_extrusion": scene.render.bake.cage_extrusion,
+                }
                 try:
                     scene.render.engine = 'CYCLES'
                     scene.render.bake.use_selected_to_active = False
@@ -1716,7 +1680,12 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                     if not final_mesh_object.data.uv_layers:
                         self.report({'ERROR'}, "Bake to Texture requires UVs, but none could be found or generated.")
                         return {'CANCELLED'}
-                    bake_image = bpy.data.images.new(name=f"{final_mesh_object.name}_Color", width=self.texture_resolution, height=self.texture_resolution, alpha=True)
+                    bake_image = bpy.data.images.new(
+                        name=f"{final_mesh_object.name}_Color",
+                        width=self.texture_resolution,
+                        height=self.texture_resolution,
+                        alpha=True
+                    )
                     if not final_mesh_object.data.materials:
                         bake_mat = bpy.data.materials.new(name="SDF_Bake_Material")
                         final_mesh_object.data.materials.append(bake_mat)
@@ -1725,14 +1694,21 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                         bake_mat = final_mesh_object.data.materials[0]
                     tree = bake_mat.node_tree
                     nodes = tree.nodes
-                    vcol_attr_node = nodes.new(type='ShaderNodeAttribute')
-                    vcol_attr_node.attribute_name = vcol_layer.name
+                    vcol_attr_node = None
+                    for node in nodes:
+                        if node.type == 'ATTRIBUTE' and node.attribute_name == vcol_layer.name:
+                            vcol_attr_node = node
+                            break
+                    if not vcol_attr_node:
+                        vcol_attr_node = nodes.new(type='ShaderNodeAttribute')
+                        vcol_attr_node.attribute_name = vcol_layer.name
                     emission_node = nodes.new(type='ShaderNodeEmission')
                     tree.links.new(vcol_attr_node.outputs['Color'], emission_node.inputs['Color'])
+                    bsdf = nodes.get("Principled BSDF")
                     output_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
                     original_link = None
-                    if output_node and output_node.inputs['Surface'].is_linked:
-                        original_link = output_node.inputs['Surface'].links[0]
+                    if bsdf and output_node and bsdf.outputs['BSDF'].links:
+                        original_link = bsdf.outputs['BSDF'].links[0]
                     if output_node:
                         tree.links.new(emission_node.outputs['Emission'], output_node.inputs['Surface'])
                     img_node = nodes.new(type='ShaderNodeTexImage')
@@ -1741,29 +1717,41 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
                     scene.cycles.bake_type = 'EMIT'
                     bpy.ops.object.bake(type='EMIT')
                     resolved_path = bpy.path.abspath(self.texture_path)
-                    output_dir = resolved_path if resolved_path and os.path.isdir(resolved_path) else os.path.join(os.path.expanduser("~"), "Desktop")
+                    if resolved_path and os.path.isdir(resolved_path):
+                        output_dir = resolved_path
+                    else:
+                        self.report({'INFO'}, "No valid path set or blend file is unsaved. Using Desktop as fallback.")
+                        desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
+                        output_dir = desktop_dir if os.path.isdir(desktop_dir) else bpy.app.tempdir
                     os.makedirs(output_dir, exist_ok=True)
-                    filepath = os.path.join(output_dir, f"{final_mesh_object.name}_Color.png")
+                    filename = f"{final_mesh_object.name}_Color.png"
+                    filepath = os.path.join(output_dir, filename)
                     self.report({'INFO'}, f"Saved baked texture to: {filepath}")
                     bake_image.save_render(filepath=filepath)
                     if original_link:
                         tree.links.new(original_link.from_socket, original_link.to_socket)
-                    elif output_node and output_node.inputs['Surface'].is_linked:
-                         tree.links.remove(output_node.inputs['Surface'].links[0])
+                    else:
+                        if output_node.inputs['Surface'].links:
+                             tree.links.remove(output_node.inputs['Surface'].links[0])
                     nodes.remove(emission_node)
-                    nodes.remove(vcol_attr_node)
-                    bsdf = nodes.get("Principled BSDF")
                     if bsdf:
                         tree.links.new(img_node.outputs['Color'], bsdf.inputs['Base Color'])
+                        if vcol_attr_node not in bsdf.inputs['Base Color'].links:
+                             nodes.remove(vcol_attr_node)
+                    else:
+                        nodes.remove(vcol_attr_node)
                 finally:
+                    self.report({'INFO'}, "Restoring original bake settings.")
                     scene.render.engine = original_engine
-                    for key, value in original_bake_settings.items():
-                        setattr(scene.render.bake, key, value)
+                    scene.render.bake.use_selected_to_active = original_bake_settings["use_selected_to_active"]
+                    scene.render.bake.margin = original_bake_settings["margin"]
+                    scene.render.bake.use_cage = original_bake_settings["use_cage"]
+                    scene.render.bake.cage_extrusion = original_bake_settings["cage_extrusion"]
 
         if self.shade_smooth and len(final_mesh_object.data.polygons) > 0:
             final_mesh_object.data.polygons.foreach_set('use_smooth', [True] * len(final_mesh_object.data.polygons)); final_mesh_object.data.update()
             
-        if self.generate_splats and final_mesh_object and len(final_mesh_object.data.polygons) > 0:
+        if self.generate_splats:
             self.create_splat_object(context, final_mesh_object)     
             
         self.report({'INFO'}, "Bake and refinement pipeline completed successfully!")
@@ -1772,6 +1760,7 @@ class OBJECT_OT_sdf_bake_volume(bpy.types.Operator):
 
 # In main.py, REPLACE the previous operator with this definitive, correct version.
 
+# In main.py, REPLACE the previous operator with this definitive, correct version.
 
 class OBJECT_OT_sdf_remesh_tools(bpy.types.Operator):
     """Opens a floating panel that displays Blender's native Remesh UI by drawing its properties directly."""
