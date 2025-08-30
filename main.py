@@ -369,12 +369,23 @@ def draw_sdf_shader():
         state.scissor_test_set(False)
         return
     state.scissor_set(scissor_x, scissor_y, scissor_w, scissor_h)
-    state.depth_test_set('NONE'); state.blend_set('NONE')
+
+    # --- MODIFICATION ---
+    # We now ENABLE the depth test. This allows the GPU to automatically
+    # hide parts of our SDF that are behind existing Blender geometry.
+    state.depth_test_set('LESS_EQUAL')
+    state.blend_set('NONE')
 
     shader.bind()
     shader.uniform_float("viewportSize", (region.width, region.height))
     shader.uniform_float("viewMatrixInv", rv3d.view_matrix.inverted())
     shader.uniform_float("projMatrixInv", rv3d.window_matrix.inverted())
+
+    # --- NEW UNIFORM ---
+    # Pass the combined matrix needed for depth calculation in the shader.
+    view_proj_matrix = rv3d.window_matrix @ rv3d.view_matrix
+    shader.uniform_float("uViewProjMatrix", view_proj_matrix)
+    # --- END NEW UNIFORM ---
 
     # --- UPDATED: Send all new lighting uniforms ---
     shader.uniform_float("uLightDir", scene.sdf_light_direction)
@@ -471,6 +482,7 @@ def draw_sdf_shader():
     batch.draw(shader)
     
     state.scissor_test_set(False)
+    # Restore the depth test to Blender's default for the 3D Viewport.
     state.depth_test_set('LESS_EQUAL')
     state.blend_set('NONE')
 

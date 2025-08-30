@@ -8,6 +8,7 @@ out vec4 fragColor;
 uniform vec2   viewportSize;
 uniform mat4   viewMatrixInv;
 uniform mat4   projMatrixInv;
+uniform mat4   uViewProjMatrix;
 uniform vec3   uLightDir;
 uniform float  uBrightness;
 uniform float  uContrast;
@@ -485,10 +486,7 @@ float getAO(vec3 p, vec3 n) {
 // ── MAIN (Updated with new lighting) ──────────────────────────────────────
 void main() {
     // --- PIXELATION LOGIC ---
-    // Cast the integer uniform to a float for calculations
     float pixel_size = float(uPixelationAmount);
-    // Snap the current pixel's coordinate to a grid defined by the pixel_size
-    // This makes every pixel within a block (e.g., 4x4) use the same starting coordinate
     vec2 pixelated_coord = floor(gl_FragCoord.xy / pixel_size) * pixel_size;
     
     // --- The rest of the setup now uses the modified coordinate ---
@@ -506,43 +504,45 @@ void main() {
         Hit h = sceneSDFColor(pos);
 
         if (h.d < 0.001) {
+            // --- DEPTH CALCULATION (HIT CASE) ---
+            vec4 clip_pos = uViewProjMatrix * vec4(pos, 1.0);
+            float ndc_depth = clip_pos.z / clip_pos.w;
+            gl_FragDepth = ndc_depth * 0.5 + 0.5;
+            
+            // --- LIGHTING CALCULATION (Unchanged) ---
             vec3 N = getNormal(pos);
             vec3 L = normalize(uLightDir);
             vec3 V = normalize(-rd);
             vec3 R = reflect(-L, N);
-
-            // --- ADVANCED LIGHTING CALCULATION (Unchanged) ---
             float ao = 1.0;
             if (uCavityEnable > 0) {
                 ao = getAO(pos, N);
             }
-            
             float diff = max(dot(N, L), 0.0);
             float spec = pow(max(dot(R, V), 0.0), SPEC_POWER) * SPEC_SCALE;
-
             vec3 col = h.col * uGlobalTint;
             col = col * ((1.0 - DIFFUSE_M) + DIFFUSE_M * diff) * ao + spec;
-
             if (h.id >= 0 && uShapeHighlight[h.id] != 0) {
                 float rim = 1.0 - max(dot(N, V), 0.0);
                 col += HIGHLIGHT * smoothstep(0.0, 1.0, pow(rim, 1.5));
             }
-            
-            // --- Post-Processing in HSV space (Unchanged) ---
             vec3 hsv = rgb2hsv(col);
             hsv.z += uBrightness;
             hsv.z = (hsv.z - 0.5) * uContrast + 0.5;
             col = hsv2rgb(hsv);
-
             fragColor = vec4(col, 1.0);
             return;
         }
         
-        // --- REVERT THIS LINE TO ITS ORIGINAL FORM ---
         t += max(0.001, h.d);
-        // --- END OF REVERT ---
 
         if (t > 100.0) break;
     }
+
+    // --- THIS IS THE FIX (MISS CASE) ---
+    // If the loop finishes, it means we didn't hit anything.
+    // Set the depth to the farthest possible value (1.0).
+    gl_FragDepth = 1.0;
     fragColor = vec4(BG_COLOR, 1.0);
+    // --- END OF FIX ---
 }
