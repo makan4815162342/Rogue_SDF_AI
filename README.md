@@ -8,6 +8,9 @@ The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep ad
 
 Please try it and let me know about the bugs and help me to improve it.
 
+New Update:
+
+Added the ability to see 3D Geometries outside of the Domain in SDF Shader View to work on the model.
 
 New Update:
 
@@ -116,6 +119,7 @@ The SDF Section: You have to first click the SDF Shader View button, you will be
 
 That's it for overviewing the buttons for everything I added so far! there are a lot to be added, and I will keep updating it, please let me know about your thoughts and try it, I will fix the Mac problem, I will add tooltips, and support for Vulkan... Be sure to check out my other Add-Ons as well and join my Discord for support and follow me on X. Here some Screenshot from the Add-On:
 
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 08 30 - 06 08 54 55" src="https://github.com/user-attachments/assets/c533dd8e-ee73-41bb-89bb-9ec9116a8448" />
 
 <img width="2560" height="1080" alt="Desktop Screenshot 2025 08 27 - 05 37 50 13" src="https://github.com/user-attachments/assets/6786924c-a048-483d-8cc0-abf495ec241e" />
 
