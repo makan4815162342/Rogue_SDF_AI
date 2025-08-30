@@ -1,12 +1,19 @@
 # Rogue_SDF_AI
 <img width="1024" height="1024" alt="20250725_2043_Holographic Futuristic Warrior_remix_01k11947psesytv6q3ne8bbq3t" src="https://github.com/user-attachments/assets/776b8188-b054-4346-bb53-2b387579ac19" />
-An SDF Add-On for Blender. Rogue SDF AI is an Add-On initially made to improve SDF Prototyer Add-On but as I worked on it, I created its own SDF Renderer and features, but I have decided to keep both SDF Prototyper Features and add my own new features and new SDF Render Shaders on top of it. I don't know where to begin TBH I added a lot of features to this Add-On, in short, this Add-On is in two sections:
+An SDF Add-On for Blender. Rogue SDF AI is an Add-On initially made to improve SDF Prototyper Add-On but as I worked on it, I created its own SDF Renderer and features, but I have decided to keep both SDF Prototyper Features and add my own new features and new SDF Render Shaders on top of it. I don't know where to begin TBH I added a lot of features to this Add-On, in short, this Add-On is in two sections:
 
 The 3D Geometry with SDF behavior, drastically improved. 
 
 The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep add and improve it.
 
 Please try it and let me know about the bugs and help me to improve it.
+
+
+https://github.com/user-attachments/assets/c95a9d6b-9f16-4141-9a7d-3f61fcff3e69
+
+
+https://github.com/user-attachments/assets/2937976a-3b28-4e17-8e5b-4663b87dcd38
+
 
 New Update:
 
