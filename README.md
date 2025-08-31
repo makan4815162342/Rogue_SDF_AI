@@ -8,6 +8,18 @@ The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep ad
 
 Please try it and let me know about the bugs and help me to improve it.
 
+Rogue SDF Add-On a Free SDF Modeling Solution in Blender, Developed by Makan Ansari, I have spent around 2 months making my own SDF add-on in Blender, with it you can make almost anything you want, I will make its tutorials soon, be sure to check it out and let me know anything goes wrong, you can join my Discord for more deeper discussion about the Add-On and how we can improve it. :)
+
+https://youtu.be/XGlmN8j-8DU?si=b3f11gePNN3ZyTPM
+
+GitHub: https://github.com/makan4815162342/Rogue_SDF_AI.git
+itch .IO: https://makan-ansari.itch.io/rogue-sdf-ai
+Gumroad: https://artistry6413.gumroad.com/l/ueuny
+Blender Artist: https://blenderartists.org/t/rogue-sdf-ai-add-on-wip/1603500?u=makanansari
+Discord: https://discord.gg/2brhtDhs
+
+#blender3d #blender #addon #plugins #3d #gamedevelopment #SDFmodeling #gamedevtools #vibecoding #ai
+
 
 https://github.com/user-attachments/assets/c95a9d6b-9f16-4141-9a7d-3f61fcff3e69
 
