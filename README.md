@@ -1,12 +1,5 @@
 # Rogue_SDF_AI
 <img width="1024" height="1024" alt="20250725_2043_Holographic Futuristic Warrior_remix_01k11947psesytv6q3ne8bbq3t" src="https://github.com/user-attachments/assets/776b8188-b054-4346-bb53-2b387579ac19" />
-An SDF Add-On for Blender. Rogue SDF AI is an Add-On initially made to improve SDF Prototyper Add-On but as I worked on it, I created its own SDF Renderer and features, but I have decided to keep both SDF Prototyper Features and add my own new features and new SDF Render Shaders on top of it. I don't know where to begin TBH I added a lot of features to this Add-On, in short, this Add-On is in two sections:
-
-The 3D Geometry with SDF behavior, drastically improved. 
-
-The SDF Shader View, with pure SDF Modeling and tools still (WIP) that I keep add and improve it.
-
-Please try it and let me know about the bugs and help me to improve it.
 
 Rogue SDF Add-On a Free SDF Modeling Solution in Blender, Developed by Makan Ansari, I have spent around 2 months making my own SDF add-on in Blender, with it you can make almost anything you want, I will make its tutorials soon, be sure to check it out and let me know anything goes wrong, you can join my Discord for more deeper discussion about the Add-On and how we can improve it. :)
 
@@ -27,116 +20,6 @@ https://github.com/user-attachments/assets/c95a9d6b-9f16-4141-9a7d-3f61fcff3e69
 https://github.com/user-attachments/assets/2937976a-3b28-4e17-8e5b-4663b87dcd38
 
 
-New Update:
-
-Added the ability to see 3D Geometries outside of the Domain in SDF Shader View to work on the model.
-
-New Update:
-
-Added Performance Control for Ray Marching two slider quality steps and performance scale to make it run faster.
-
-Added Remesh with Voxel and QuadriFlow as a new button for better Retopology.
-
-Added Groove and Pipe as new Blending Types.
-
-Canceled: Added Texture Buffer Object (TBO) support to the shader that enables the Add-On to Add 1024 shapes and even more., paused.
-
-
-New Update:
-
-Improved and added lots of features, my next attempt will be making a better export with C++ and an SDF Render Engine with C++:
-
-New Changes: Domain Scale, Shape Scale, duplicate and Repeat, Mirror, Radial Symmetry inherit their blending, color, smoothing.
-
-Intersection is not working that way, only with one object.
-
-Added Symmetrize One side to the other.
-
-Added Flip for select or all shapes.
-
-Fixed the Sphere nonuniformly scale problem.
-
-Fixed the Curve and Cone, the Curve now have better controls and profiles.
-
-Greatly improved the Curve Shape, pointy head and tails, scale and radius, smooth and hard shapes...
-
-Fixing Symmetrized, Repeat, duplicate for the Curve and bake symmetry for the Curve.
-
-Curve Duplicate is fixed.
-
-Fixed Repeat for Curve.
-
-Improved the SDF Shader View, it only shows withing the Domain Border and it increased the speed by 10X if zoomed out.
-
-Improved the Symmetrize Model, if you pass the center, it won't crash and it supports Curve and Cylinder Z symmetrize now works.
-
-Enabled Points as mesh view to increase the speed for the 3D Geometry section, don't know if it can speed that much but helps.
-
-Added Roundness for the Cube for SDF Shader View.
-
-Added Thickness for the Cube for SDF Shader View.
-
-Added Bevel for the Cube for SDF Shader View.
-
-Added Pyramid effect for the Cube for SDF Shader View.
-
-Added Twist effect for the Cube for SDF Shader View.
-
-Added Bend effect for the Cube for SDF Shader View.
-
-Added these features to Cylinder too.
-
-Added Capsule to the Sphere, Thickness, Pac Man.
-
-Added Cylinder Effect to the Prism, plus made it Ngon.
-
-Fixed the Symmetry and Flipped as much as I could.
-
-Added the Features to the Torus too, Thickness, Inner and Outer Radius, and Pac Man Cut 360.
-
-Added More shapes with their features to the Curve.
-
-Added Space and Local Orientation to the Curve.
-
-Added Elongation to the Torus and its Curve feature.
-
-Added Custom Points with all of the features, position, radius, local rotation and shape features for the Curve.
-
-Added Paint Blending mode as color for all of the shapes.
-
-Added a better Mesh Export PyMCubes that give us better results.
-
-Added Color Export as Vertex Color from SDF.
-
-Added new Blending modes with new Strength slider Displace, Indent, Relief, Engrave, Tunnel.
-
-Added the Mask Blending Mode.
-
-Added Chamfer Blending type.
-
-Added more selection methods for better exporting.
-
-Added third method of exporting VDB with Color.
-
-Improved the Light Preview.
-
-Added Support for Mac and Linux too.
-
-Added Exporting UVs with Texture Map from Vertex Color.
-
-Added Support for Splats with particles that works as path in hair system too or custom shape.
-
-Added support for baking from a Remeshed object.
-
-Added Radial for Repeat.
-
-The Previous Updates:
-
-Let me explains some of its new features, improvements: The 3D Geometry Section: 1-Scale: I added unform Scale to control the scale of all of the shapes inside the Domain. 2-Automatic Preview: I added a Dynamic Resolution that when you move the SDF Shapes they go to lower resolution to work faster and when stopped they go back to higher resolution, you can control the delay and sensitivity. 3-Manual Preview: You can manually control these resolutions yourself. 4-Decimation: I made a complex Decimation Node from YouTube Tutorials and linked it to the main file; you can control the resolution of the models while modeling to control the resolution better. 5-Toggle Overlays: you can toggle it on and off to see the 3D Models more clearly. 6-The SDF List: I added Mute Shapes, Hide Empties, highlight for the SDF Shapes, Color indicator for select shape (Red) in the SDF List, I fixed and improved the Duplicate, move the shape up and down, delete, clear all and I also added Repeat to create a repeat for the shapes. 7-Enable SDF Shader View: it will take to the SDF Section I will talk about it below soon. 8-The SDF Shapes Settings for 3D Geometries: Most of this section is from the Legacy section of the Add-On I sort them out better and added some new features like Flip Shape along X,Y,Z you can flip your shapes with it. 9-Symmetry Section: it's for SDF Section I will talk about it Below soon. 10-Convert to Mesh: you can Convert your mesh, what you see is what you get. 11-Bake to High Quality Mesh: I will talk about it soon since it's for SDF Section Below. 12-Bake Active Symmetry: it's related to SDF Section, I will talk about it below. 13-Brush-Cube Clipping: This Brush let you clip the shapes or let's say crop them, it can be used as a way of modeling or just similar to Zbrush you temporary hide the rest work on that section then delete the brush to see the rest of the model, it helps for faster modeling. 14-Show Render Options: This is a very helpful part of the features I added for the 3D Geometry to be able to see a high res version of your model in render mode fast, you can select to render from either Camera or Viewport, I recommend the Viewport, you can select it to be Eevee or Cycle, it can be render from the Default shading, Material shading or the Rendered Shading, you can set the resolution up to 5, scale of the image samples for the renderer and you can disable the overlays to see with our without wireframes and such and finally you can render from the viewport or final render for camera. 15-Renameing Option: I also forgot to mention I added a renaming option to avoid problems and better cleaning, I want to add a auto renaming system soon.
-
-The SDF Section: You have to first click the SDF Shader View button, you will be sent to a SDF Preview Render. 1-Max Samples: Front the top this is for the curve mostly, it will help you to have more detailed Curves. 2-Highlight Shape: It will show you the shape in the viewport you selected to help you find it, I will add the subtract version of it too. 3-Preview Light: It will help you to change the lighting for the SDF Shader View, I will improve it more to have more highlight, contrast, and better navigation. 4-Sahpe Settings: 1-it has a renaming option, 2-Shader Operations: I added a Global Tint to change the color of the whole objects, 3-Operations: I added Union with Blend, Subtraction and Intersect so far all of them blend colors hard of soft (I will talk about it more below) Shape Features will be added soon but for now we only can Blend, 4-Color: we can change the color of the shapes, 5-Color Blend: we have hard or soft color that we can blend between the objects, 6-Symmetry: Mirror X,Y,Z and Radial Symmetry, I added these cool features for better modeling. 5-Finlize Mesh: 1-We already talked about the Convert to Mesh, 2-Bake to High Quality Mesh: this section let you export your SDF Shapes to Geometry, it has quite cool features in it, the resolution section should be less than 512 and the scale should be 2, you need to locate and name your Volume Mesh to be saved and it will automatically bring it to the Add-On and give your the Geometry and the rest are optimization and improvement that you can try yourself to get a good shape. 6-Bake Active Symmetry: this button will bake the mirrored or radial symmetry object to actual SDF Shapes to be able to export them. 7-I added a brand-new Curve for the SDF Shapes, remade the Cone, and the rest of the shapes will be improved they will have more features and maybe add more shapes even.
-
-That's it for overviewing the buttons for everything I added so far! there are a lot to be added, and I will keep updating it, please let me know about your thoughts and try it, I will fix the Mac problem, I will add tooltips, and support for Vulkan... Be sure to check out my other Add-Ons as well and join my Discord for support and follow me on X. Here some Screenshot from the Add-On:
 
 <img width="2560" height="1080" alt="Desktop Screenshot 2025 08 30 - 06 08 54 55" src="https://github.com/user-attachments/assets/c533dd8e-ee73-41bb-89bb-9ec9116a8448" />
 
