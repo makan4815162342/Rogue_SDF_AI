@@ -37,6 +37,7 @@ https://github.com/user-attachments/assets/c95a9d6b-9f16-4141-9a7d-3f61fcff3e69
 https://github.com/user-attachments/assets/2937976a-3b28-4e17-8e5b-4663b87dcd38
 
 
+<img width="2560" height="1080" alt="Desktop Screenshot 2025 09 29 - 21 57 25 75" src="https://github.com/user-attachments/assets/47fc114c-9c1b-4a2a-a9f4-8cc8f00a7d31" />
 
 <img width="2560" height="1080" alt="Desktop Screenshot 2025 08 30 - 06 08 54 55" src="https://github.com/user-attachments/assets/c533dd8e-ee73-41bb-89bb-9ec9116a8448" />
 
