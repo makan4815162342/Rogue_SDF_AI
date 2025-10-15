@@ -1,7 +1,24 @@
 # Rogue_SDF_AI
 <img width="1024" height="1024" alt="20250725_2043_Holographic Futuristic Warrior_remix_01k11947psesytv6q3ne8bbq3t" src="https://github.com/user-attachments/assets/776b8188-b054-4346-bb53-2b387579ac19" />
 
-Rogue SDF Add-On a Free SDF Modeling Solution in Blender, Developed by Makan Ansari, I have spent around 2 months making my own SDF add-on in Blender, with it you can make almost anything you want, I will make its tutorials soon, be sure to check it out and let me know anything goes wrong, you can join my Discord for more deeper discussion about the Add-On and how we can improve it. :)
+Rogue SDF Add-On a Free SDF Modeling Solution in Blender, Developed by Makan Ansari.
+
+Rogue SDF has many features that rivals the famous SDF Apps, such as:
+-9 ways of SDF operations.
+
+-4 types of SDF Blends.
+
+-It's the only SDF Add-On that has hard and soft color blending.
+
+-The SDF Shapes have many shape features like Twist, Bend, Thickness that few have these features...
+
+-Very Powerful Spline with so many controls...
+
+-Very powerful export features like Fast Direct (Additive) can export up to 6 million polygons less than 5 minutes, 
+
+-It even can export splats and many more features
+
+I will keep updating and improving it since it's my own daily tool to make models for my projects, be sure to check it out and be in touch with me as I keep updating and adding more features and making tutorials for it.
 
 https://youtu.be/XGlmN8j-8DU?si=b3f11gePNN3ZyTPM
 
