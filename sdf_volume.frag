@@ -356,27 +356,36 @@ Hit sceneSDF(vec3 p) {
     int lastOp = 0;
     float lastBlend = 0.0;
     float lastStrength = 0.0;
-    float lastFill = 0.0; // <-- ADD THIS
+    float lastFill = 0.0;
+
+    // --- NEW: Early-Exit Optimization for Speed ---
+    // If the point is far from the domain center, skip the expensive loop.
+    // The threshold is set high (e.g., 10.0) because we only care about points
+    // near the surface for meshing. This is a massive speedup.
+    if (length(p - uDomainCenter) > 10.0) {
+        return accum;
+    }
+    // --- END NEW ---
 
     for (int i = 0; i < uCount; ++i) {
         Hit h = evalPrim(i, p);
         if (h.id < 0) continue;
 
         if (h.id != currentID && currentID != -1) {
-            accum = combine(accum, group, lastOp, lastBlend, lastStrength, lastFill); // <-- UPDATE THIS
+            accum = combine(accum, group, lastOp, lastBlend, lastStrength, lastFill);
             group = h;
         } else {
-            group = (group.id < 0) ? h : combine(group, h, 0, 0.0, 0.0, 0.0);  // <-- UPDATE THIS
+            group = (group.id < 0) ? h : combine(group, h, 0, 0.0, 0.0, 0.0);
         }
         currentID = h.id;
         lastOp = uShapeOp[i];
         lastBlend = uShapeBlend[i];
         lastStrength = uShapeBlendStrength[i];
-        lastFill = uShapeMaskFill[i]; // <-- ADD THIS
+        lastFill = uShapeMaskFill[i];
     }
 
     if (currentID != -1) {
-        accum = combine(accum, group, lastOp, lastBlend, lastStrength, lastFill); // <-- UPDATE THIS
+        accum = combine(accum, group, lastOp, lastBlend, lastStrength, lastFill);
     }
     return accum;
 }
