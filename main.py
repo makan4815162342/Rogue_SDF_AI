@@ -55,6 +55,13 @@ try:
 except ImportError:
     HAS_OPENVDB = False
 
+# --- NEW: Add check for scipy ---
+try:
+    from scipy.ndimage import zoom  # Specifically check the function used in adaptive bake
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False  
+
 
 # keep these globals at the top
 handler = shader = batch = None
@@ -3053,6 +3060,30 @@ class SDFPrototyperPanel(bpy.types.Panel):
             layout.operator("object.start_sdf", text="Generate SDF", icon='GEOMETRY_NODES')
             return
 
+        # --- NEW: Library Checklist Section (added here for top placement) ---
+        box = layout.box()
+        box.label(text="Library Checklist (Required for Baking/Exporting):")
+        # In the checklist box:
+        row = box.row()
+        row.label(text="scipy (for adaptive bake)", icon='CHECKMARK' if HAS_SCIPY else 'ERROR')
+        row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "scipy"
+
+        row = box.row()
+        row.label(text="scikit-image (main mesher)", icon='CHECKMARK' if HAS_SKIMAGE else 'ERROR')
+        row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "skimage"
+
+        row = box.row()
+        row.label(text="PyMCubes (fallback mesher)", icon='CHECKMARK' if HAS_MCUBES else 'ERROR')
+        row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "pymcubes"
+
+        row = box.row()
+        row.label(text="pyopenvdb (optional VDB smoothing)", icon='CHECKMARK' if HAS_OPENVDB else 'ERROR')
+        row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "openvdb"
+
+        # Guide button
+        box.operator("prototyper.sdf_library_guide", text="Show Fix/Install Guide if Missing")
+        # --- End NEW ---
+
         # ... (The first part of the panel is unchanged)
         preview_box = layout.box()
         preview_box.label(text="Performance & Preview", icon='MOD_WAVE')
@@ -5271,6 +5302,76 @@ class SDFNodeItem(PropertyGroup):
 # -------------------------------------------------------------------
 # 2) List of classes to register (excluding PropertyGroup)
 # -------------------------------------------------------------------
+
+class SDFLibraryTooltipOperator(bpy.types.Operator):
+    """Show tooltip for library"""
+    bl_idname = "prototyper.sdf_library_tooltip"
+    bl_label = "Library Info"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    library: bpy.props.StringProperty()  # Pass the library name to show specific text
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        if self.library == 'scipy':
+            layout.label(text="Required for adaptive baking (uses ndimage.zoom for resampling).")
+            layout.label(text="Install: python.exe -m pip install scipy in Blender's python bin.")
+        elif self.library == 'skimage':
+            layout.label(text="Main library for marching cubes meshing (skimage.measure).")
+            layout.label(text="Install: python.exe -m pip install scikit-image.")
+        elif self.library == 'pymcubes':
+            layout.label(text="Fallback mesher if skimage fails (pymcubes.marching_cubes).")
+            layout.label(text="Install: python.exe -m pip install PyMCubes.")
+        elif self.library == 'openvdb':
+            layout.label(text="Optional for VDB volume smoothing (openvdb.tools).")
+            layout.label(text="Hard to install on Windows; requires building from source or skipping.")
+
+class SDFLibraryGuideOperator(bpy.types.Operator):
+    """Show guide for installing libraries and cleaning up issues"""
+    bl_idname = "prototyper.sdf_library_guide"
+    bl_label = "Library Installation Guide"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.invoke_props_dialog(self, width=600)  # Wider popup for readability
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="If baking/exporting fails (e.g., missing modules), try a clean reset:")
+        box.label(text="1. Close Blender. Go to Windows Settings > Apps > Uninstall Blender.")
+        box.label(text="2. For a targeted cleanup (to avoid affecting other Python apps), open File Explorer and navigate to these folders (replace <your username> with your actual Windows username, e.g., 'Lion'):")
+        box.label(text="   - C:\\Users\\<your username>\\AppData\\Roaming\\Python\\Python311\\site-packages")
+        box.label(text="   - C:\\Users\\<your username>\\AppData\\Roaming\\Python\\Python310\\site-packages (if it exists)")
+        box.label(text="   In each folder, search for folders/files related to: scipy, scikit-image (or skimage), PyMCubes (or pymcubes), pyopenvdb (or openvdb).")
+        box.label(text="   Right-click and delete only those specific items. Do NOT delete the entire site-packages folder unless you're sure no other apps use it.")
+        box.label(text="3. Delete the Blender user data folder: C:\\Users\\<your username>\\AppData\\Roaming\\Blender Foundation\\Blender")
+        box.label(text="4. Delete the Blender install folder if remnants remain: C:\\Program Files\\Blender Foundation\\Blender 4.5")
+        box.label(text="5. Re-download and reinstall Blender 4.5 LTS from blender.org (use the .msi installer).")
+        box.label(text="6. Reinstall the Rogue SDF AI add-on ZIP via Preferences > Add-ons > Install.")
+        box.label(text="7. To install missing libraries, open Command Prompt as Administrator (search 'cmd' in Start menu, right-click > Run as administrator).")
+        box.label(text="   Run these commands one by one (adjust Blender path if different):")
+        box.label(text="   cd \"C:\\Program Files\\Blender Foundation\\Blender 4.5\\4.5\\python\\bin\"")
+        box.label(text="   python.exe -m ensurepip --upgrade  (installs/upgrades pip if needed)")
+        box.label(text="   python.exe -m pip install --upgrade pip")
+        box.label(text="   python.exe -m pip install scipy")
+        box.label(text="   python.exe -m pip install scikit-image")
+        box.label(text="   python.exe -m pip install PyMCubes")
+        box.label(text="   For pyopenvdb (optional, for VDB smoothing): It's hard on Windows—no easy pip install. Skip or build from source (advanced).")
+        box.label(text="8. Create a Blender shortcut with --python-use-system-env in Target for full access (right-click blender.exe > Create shortcut > Properties).")
+        box.label(text="9. Restart Blender and test baking/exporting.")
+        box.label(text="If builds fail in CMD (e.g., compiler error), install free Visual Studio Build Tools from Microsoft (search 'Visual C++ Build Tools').")
+
 # -------------------------------------------------------------------
 # 2) List of classes to register (excluding PropertyGroup)
 # -------------------------------------------------------------------
@@ -5281,6 +5382,9 @@ _classes = [
     SDF_UL_nodes,
     SDF_UL_curve_points,
     VIEW3D_MT_sdf_rclick,
+
+    SDFLibraryGuideOperator,
+    SDFLibraryTooltipOperator,
 
     # Data Structures (must be registered before classes that use them)
     SDFCurveControlPoint,
@@ -5340,6 +5444,8 @@ _classes = [
 
 _addon_keymaps = []
 _timer_is_running = False
+
+
 
 # -------------------------------------------------------------------
 # 3) REGISTER
