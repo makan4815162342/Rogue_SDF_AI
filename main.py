@@ -163,28 +163,36 @@ def collect_sdf_data(context):
     if not domain:
         return [(-1, (0,0,0), (1,1,1), (1,0,0,0), 0, 0.0, 0, 0, (1,1,1), 0, -1, (0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0), 0.0, 0.0)] * MAX_SHAPES_CURRENT
 
-    # --- NEW: Get view mode and selected objects ---
     view_mode = context.scene.sdf_view_mode
     selected_empties = {obj for obj in context.view_layer.objects.selected}
-    # --- END NEW ---
 
     for item_index, item in enumerate(domain.sdf_nodes):
         e = item.empty_object
         if not e or item.is_hidden:
             continue
 
-        # --- NEW: Filtering Logic ---
+        # --- ROBUSTNESS FIX: Check parent_index validity before accessing ---
+        if item.parent_index >= 0:
+            # Ensure the parent_index is within the valid range of the list
+            if item.parent_index < len(domain.sdf_nodes):
+                parent_item = domain.sdf_nodes[item.parent_index]
+                if parent_item.is_group and parent_item.is_hidden:
+                    continue # Skip if the parent group is hidden
+            else:
+                # This indicates data corruption, but we prevent a crash
+                item.parent_index = -1 # Reset the invalid parent index
+                item.level = 0
+        # --- END FIX ---
+
         is_selected = e in selected_empties
         if view_mode == 'SELECTED' and not is_selected:
-            continue # Skip if we only want selected, and this one isn't
+            continue
         if view_mode == 'UNSELECTED' and is_selected:
-            continue # Skip if we only want unselected, and this one is
-        # --- END NEW ---
+            continue
 
         if len(shapes) >= MAX_SHAPES_CURRENT:
             continue
 
-        # In function collect_sdf_data, inside the for loop:
         op_base = op_map.get(item.operation, 3)
         op = op_base
         if item.operation in ['UNION', 'SUBTRACT', 'INTERSECT']:
@@ -195,7 +203,6 @@ def collect_sdf_data(context):
             elif item.blend_type == 'PIPE':
                 op = op_base + 30
         
-        # ... (the rest of the function from this point on is identical to your current version)
         code = { 'MESH_CUBE': 0, 'MESH_UVSPHERE': 1, 'MESH_TORUS': 2, 'MESH_CYLINDER': 3, 'MESH_CONE': 4, 'MESH_ICOSPHERE': 5, 'CAPSULE': 6 }.get(item.icon, -1)
         blend = item.blend
         strength = item.blend_strength
@@ -937,82 +944,110 @@ def update_sdf_global_scale(self, context):
 def update_sdf_node_name(self, context):
     """
     This function is called when a node's name is changed in the UI.
-    It ensures that the associated Empty object is also renamed,
-    and crucially, that the custom property on the geometry node
-    is updated to maintain the connection.
+    It handles renaming for both shapes and groups.
     """
-    # 'self' is the SDFNodeItem being changed.
+    # If it's a group, just redraw the UI and we're done.
+    if self.is_group:
+        _redraw_shader_view(self, context)
+        return
+
+    # If it's a shape, proceed with renaming the associated objects.
     empty_obj = self.empty_object
     domain_obj = context.scene.sdf_domain
 
     if not empty_obj or not domain_obj:
         return
 
-    # This is the new name the user typed.
     new_name = self.name
     
-    # This prevents an infinite loop if the name hasn't actually changed.
     if empty_obj.name == new_name:
         return
         
-    # We need to find the Geometry Node using the OLD name before we change it.
     old_name = empty_obj.name
     mod = domain_obj.modifiers.get("GeometryNodes")
     if mod and mod.node_group:
         node_tree = mod.node_group
-        # Find the specific node linked to our empty.
         node = next((n for n in node_tree.nodes if n.get("associated_empty") == old_name), None)
         
-        # Now, perform the renames.
         empty_obj.name = new_name
         
-        # If we found the corresponding node, update its internal link.
         if node:
             node["associated_empty"] = new_name
-
-def update_sdf_viewport_visibility(self, context):
-    """
-    Called when the viewport visibility icon is clicked in the UI list.
-    Toggles the hide_viewport property of the associated Empty object.
-    """
-    if self.empty_object:
-        # 'self' is the SDFNodeItem being changed.
-        # This line syncs the Empty's viewport visibility with our new property.
-        self.empty_object.hide_viewport = self.is_viewport_hidden            
 
 
 
 class SDF_UL_nodes(bpy.types.UIList):
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
             sdf_node = item
-            is_valid = sdf_node.empty_object and sdf_node.empty_object.name in context.view_layer.objects
+            is_valid = (not sdf_node.is_group and sdf_node.empty_object and sdf_node.empty_object.name in context.view_layer.objects) or sdf_node.is_group
 
-            if is_valid:
-                active_index = getattr(active_data, active_propname)
-                is_active = (data.sdf_nodes[active_index] == item) if 0 <= active_index < len(data.sdf_nodes) else False
-                
-                row = layout.row(align=True)
-                if is_active:
-                    row.alert = True
-                
-                op = row.operator("object.select_empty", text=sdf_node.name, icon=sdf_node.icon, emboss=False)
-                op.empty_name = sdf_node.empty_object.name
+            row = layout.row(align=True)
 
-                sub = row.row(align=True)
+            for _ in range(sdf_node.level):
+                row.label(text="", icon='BLANK1')
+
+            if sdf_node.is_group:
+                subrow = row.row(align=True)
+                subrow.prop(sdf_node, "expanded", text="", icon='TRIA_DOWN' if sdf_node.expanded else 'TRIA_RIGHT', emboss=False)
+                
+                op = subrow.operator("prototyper.sdf_select_group_item", text=sdf_node.name, emboss=False)
+                op.index = index
+                
+                subrow.prop(sdf_node, "group_color", text="")
+
+                sub = subrow.row(align=True)
                 sub.alignment = 'RIGHT'
                 
-                # The broken line referencing use_point_cloud_preview has been removed.
+                sub.operator("prototyper.sdf_highlight_group", text="", icon='RESTRICT_SELECT_ON')
+                icon_hide = 'HIDE_OFF' if not sdf_node.is_hidden else 'HIDE_ON'
+                sub.operator("prototyper.sdf_hide_group", text="", icon=icon_hide)
                 
-                highlight_icon = 'RESTRICT_SELECT_ON' if sdf_node.use_highlight else 'RESTRICT_SELECT_OFF'
-                sub.prop(sdf_node, "use_highlight", text="", icon=highlight_icon, emboss=True)
+            else: # Regular shape row
+                if is_valid:
+                    active_index = getattr(active_data, active_propname)
+                    is_active = (data.sdf_nodes[active_index] == item) if 0 <= active_index < len(data.sdf_nodes) else False
+                    
+                    if is_active:
+                        row.alert = True
+                    
+                    op = row.operator("object.select_empty", text=sdf_node.name, icon=sdf_node.icon, emboss=False)
+                    op.empty_name = sdf_node.empty_object.name if sdf_node.empty_object else ""
 
-                sub.prop(sdf_node, "is_viewport_hidden", text="", icon_only=True, emboss=True)
-                sub.prop(sdf_node, "is_hidden", text="")
+                    sub = row.row(align=True)
+                    sub.alignment = 'RIGHT'
+                    
+                    highlight_icon = 'RESTRICT_SELECT_ON' if sdf_node.use_highlight else 'RESTRICT_SELECT_OFF'
+                    sub.prop(sdf_node, "use_highlight", text="", icon=highlight_icon, emboss=True)
 
-            else:
-                row = layout.row(align=True)
-                row.label(text=f"'{sdf_node.name}' is broken!", icon='ERROR')
-                row.operator("prototyper.sdf_cleanup_list", text="Clean List", icon='BRUSH_DATA')
+                    sub.prop(sdf_node, "is_viewport_hidden", text="", icon_only=True, emboss=True)
+                    sub.prop(sdf_node, "is_hidden", text="")
+                else:
+                    row.label(text=f"'{sdf_node.name}' is broken!", icon='ERROR')
+                    row.operator("prototyper.sdf_cleanup_list", text="", icon='BRUSH_DATA')
+
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon=item.icon if not item.is_group else 'OUTLINER_COLLECTION')
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname)
+        filtered = [self.bitflag_filter_item] * len(items)
+        ordered = list(range(len(items)))
+
+        parent_stack = []
+        for i, item in enumerate(items):
+            while parent_stack and parent_stack[-1][0] >= item.level:
+                parent_stack.pop()
+            
+            if parent_stack and not parent_stack[-1][1]:
+                filtered[i] &= ~self.bitflag_filter_item
+            
+            if item.is_group:
+                parent_stack.append((item.level, item.expanded))
+
+        return filtered, ordered
+    
 
 class SDF_UL_curve_points(bpy.types.UIList):
     """The UIList for displaying custom curve control points."""
@@ -3060,31 +3095,25 @@ class SDFPrototyperPanel(bpy.types.Panel):
             layout.operator("object.start_sdf", text="Generate SDF", icon='GEOMETRY_NODES')
             return
 
-        # --- NEW: Library Checklist Section (added here for top placement) ---
+        # --- Library Checklist Section ---
         box = layout.box()
         box.label(text="Library Checklist (Required for Baking/Exporting):")
-        # In the checklist box:
         row = box.row()
         row.label(text="scipy (for adaptive bake)", icon='CHECKMARK' if HAS_SCIPY else 'ERROR')
         row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "scipy"
-
         row = box.row()
         row.label(text="scikit-image (main mesher)", icon='CHECKMARK' if HAS_SKIMAGE else 'ERROR')
         row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "skimage"
-
         row = box.row()
         row.label(text="PyMCubes (fallback mesher)", icon='CHECKMARK' if HAS_MCUBES else 'ERROR')
         row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "pymcubes"
-
         row = box.row()
         row.label(text="pyopenvdb (optional VDB smoothing)", icon='CHECKMARK' if HAS_OPENVDB else 'ERROR')
         row.operator("prototyper.sdf_library_tooltip", text="", icon='QUESTION').library = "openvdb"
-
-        # Guide button
         box.operator("prototyper.sdf_library_guide", text="Show Fix/Install Guide if Missing")
-        # --- End NEW ---
+        box.operator("prototyper.sdf_copy_commands", text="Copy Commands to Clipboard")
 
-        # ... (The first part of the panel is unchanged)
+        # --- Performance & Preview Section ---
         preview_box = layout.box()
         preview_box.label(text="Performance & Preview", icon='MOD_WAVE')
         col = preview_box.column(align=True)
@@ -3098,6 +3127,8 @@ class SDFPrototyperPanel(bpy.types.Panel):
             ray_box.label(text="Ray March Performance")
             ray_box.prop(scene, "sdf_raymarch_max_steps")
             ray_box.prop(scene, "sdf_pixelation_amount")
+
+        # --- Domain Settings Section ---
         res_box = layout.box()
         res_box.label(text="Domain Settings", icon='OBJECT_DATA')
         res_col = res_box.column(align=True)
@@ -3123,6 +3154,8 @@ class SDFPrototyperPanel(bpy.types.Panel):
             st = res_box.row()
             st.label(text="Status:")
             st.label(text=scene.sdf_status_message)
+
+        # --- Global Controls Section ---
         box = layout.box()
         box.label(text="Global Controls", icon='SETTINGS')
         col = box.column(align=True)
@@ -3141,6 +3174,8 @@ class SDFPrototyperPanel(bpy.types.Panel):
         layout.separator()
         row = layout.row()
         row.operator("view3d.toggle_sdf_overlays", text="Toggle Overlays", icon='OVERLAY')
+
+        # --- Main UI List ---
         view_box = layout.box()
         view_box.label(text="View Filter", icon='HIDE_OFF')
         view_box.prop(scene, "sdf_view_mode", expand=True)
@@ -3156,11 +3191,40 @@ class SDFPrototyperPanel(bpy.types.Panel):
         ops.separator()
         ops.operator("prototyper.sdf_clear",        icon='X',         text="")
         layout.separator()
+                
+        # --- Group Management Section ---
+        if domain:
+            group_box = layout.box()
+            group_box.label(text="Group Management", icon='OUTLINER_COLLECTION')
+            
+            col = group_box.column(align=True)
+            row = col.row(align=True)
+            row.operator("prototyper.sdf_add_group", text="Add Group")
+            row.operator("prototyper.sdf_assign_to_group", text="Assign to Group")
+            
+            row = col.row(align=True)
+            row.operator("prototyper.sdf_ungroup", text="Remove from Group")
+            row.operator("prototyper.sdf_clear_group", text="Clear Group")
+            row.operator("prototyper.sdf_delete_group", text="Delete Group")
+
+            col.separator()
+            
+            row = col.row(align=True)
+            row.operator("prototyper.sdf_select_group", text="Select Children")
+            row.operator("prototyper.sdf_highlight_group", text="Highlight Children")
+
+            row = col.row(align=True)
+            row.operator("prototyper.sdf_hide_group", text="Toggle Hide")
+            row.operator("prototyper.sdf_lock_group", text="Toggle Lock")
+
+        else:
+            layout.label(text="No SDF domain—click Start SDF", icon='ERROR')
+        
+        # --- Shader View & Shape/Group Settings ---
         layout.prop(scene, "sdf_shader_view", text="Enable SDF Shader View", icon='SHADING_RENDERED')
         if scene.sdf_shader_view:
             light_box = layout.box()
             light_box.label(text="Advanced Preview Lighting", icon='MATERIAL')
-            
             col = light_box.column()
             col.prop(scene, "sdf_light_direction", text="")
             col.separator()
@@ -3174,175 +3238,184 @@ class SDFPrototyperPanel(bpy.types.Panel):
             row_cavity = cavity_box.row()
             row_cavity.enabled = scene.sdf_cavity_enable
             row_cavity.prop(scene, "sdf_cavity_strength")
+        
         layout.separator()
-        shape_box = layout.box()
-        shape_box.label(text="Shape Settings", icon='MODIFIER_DATA')
+        
         idx = domain.active_sdf_node_index
         if 0 <= idx < len(domain.sdf_nodes):
-            item  = domain.sdf_nodes[idx]
-            empty = item.empty_object
-            if empty and empty.name in context.view_layer.objects:
-                geo  = get_sdf_geometry_node_tree(context)
-                node = next((n for n in geo.nodes if n.get("associated_empty") == empty.name), None)
-                if node:
-                    b = shape_box.box()
-                    b.label(text=f"'{item.name}' Settings", icon='OBJECT_DATA')
-                    sub = b.column(align=True)
-                    sub.prop(item, "name", text="")
-                    if scene.sdf_shader_view:
-                        sb = b.box()
-                        sb.label(text="Shader Operations", icon='SHADING_RENDERED')
-                        sc2 = sb.column(align=True)
-                        sc2.prop(scene, "sdf_global_tint", text="Global Tint")
-                        sc2.prop(item, "operation", text="Operation")
-                        if item.operation in {'UNION', 'SUBTRACT', 'INTERSECT'}:
-                            sc2.prop(item, "blend_type", text="Blend Type")
-                            blend_label = "Chamfer Size" if item.blend_type == 'CHAMFER' else "Smoothness"
-                            sc2.prop(item, "blend", text=blend_label)
-                        elif item.operation in {'DISPLACE', 'INDENT', 'RELIEF', 'ENGRAVE'}:
-                            sc2.prop(item, "blend_strength", text="Strength")
-                            sc2.prop(item, "blend", text="Smoothness")
-                        elif item.operation == 'MASK':
-                            #sc2.prop(item, "blend_strength", text="Shell Thickness")
-                            sc2.prop(item, "blend", text="Edge Smoothness")
-                        elif item.operation == 'PAINT':
-                             sc2.prop(item, "blend_strength", text="Feather")
-                        if item.icon == 'MESH_CUBE':
-                            sc2.prop(item, "thickness"); sc2.prop(item, "roundness"); sc2.prop(item, "bevel"); sc2.prop(item, "pyramid"); sc2.prop(item, "twist"); sc2.prop(item, "bend")
-                        elif item.icon == 'MESH_UVSPHERE':
-                            sc2.prop(item, "sphere_thickness"); sc2.prop(item, "sphere_elongation"); sc2.prop(item, "sphere_cut_angle")
-                        elif item.icon == 'MESH_CYLINDER':
-                            sc2.prop(item, "cylinder_thickness"); sc2.prop(item, "cylinder_roundness"); sc2.prop(item, "cylinder_pyramid"); sc2.prop(item, "cylinder_bend")
-                        elif item.icon == 'MESH_ICOSPHERE':
-                            sc2.prop(item, "prism_sides"); sc2.prop(item, "prism_thickness"); sc2.separator(); sc2.label(text="Deformers:"); sc2.prop(item, "prism_pyramid"); sc2.prop(item, "prism_bend"); sc2.prop(item, "prism_twist")
-                        elif item.icon == 'MESH_TORUS':
-                            sc2.prop(item, "torus_outer_radius"); sc2.prop(item, "torus_inner_radius"); sc2.prop(item, "torus_thickness"); sc2.prop(item, "torus_cut_angle"); sc2.prop(item, "torus_elongation")
-                        sc2.prop(item, "preview_color", text="Color")
-                        sc2.prop(scene, "sdf_color_blend_mode", text="Color Blend")
-                    else:
-                        gn = b.box()
-                        gn.label(text="Modeling Mode Inputs", icon='NODETREE')
-                        tabs = gn.row(align=True)
-                        tabs.prop(scene, "sdf_shape_tab", expand=True)
-                        col3 = gn.column(align=True)
-                        if scene.sdf_shape_tab == 'DEFORM':
-                            row3 = col3.row(align=True)
-                            row3.label(text="Flip Shape:")
-                            op_x = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="X"); op_x.axis = 'X'
-                            op_y = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Y"); op_y.axis = 'Y'
-                            op_z = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Z"); op_z.axis = 'Z'
-                            col3.separator()
-                        for sock in node.inputs:
-                            key = sock.name.lower()
-                            tab = scene.sdf_shape_tab
-                            show = ((tab=='BASIC' and any(k in key for k in ("radius","width","height","depth","size"))) or (tab=='DEFORM' and any(k in key for k in ("bend","twist","taper","scale"))) or (tab=='STYLE' and any(k in key for k in ("blend","style","soft","round"))) or (tab=='MISC' and not any(k in key for k in ("sdf","slice","object"))))
-                            if show:
-                                col3.prop(sock, "default_value", text=sock.name)
-                    if item.icon == 'CURVE_BEZCURVE':
-                        curve_box = b.box()
-                        curve_box.label(text="Curve Settings", icon='CURVE_DATA')
-                        ccol = curve_box.column(align=True)
-                        ccol.prop(item, "curve_mode", expand=True)
-                        ccol.prop(item, "curve_control_mode", expand=True)
-                        if item.curve_control_mode == 'UNIFORM':
-                            uniform_box = ccol.box()
-                            ucol = uniform_box.column(align=True)
-                            ucol.prop(item, "curve_instance_type", text="Shape")
-                            ucol.prop(item, "curve_point_density")
-                            ucol.prop(item, "curve_instance_spacing", text="Spacing")
-                            ucol.prop(item, "curve_instance_rotation", text="Rotation")
-                            inst_box = uniform_box.box()
-                            inst_box.label(text=f"{item.curve_instance_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
-                            icol = inst_box.column(align=True)
-                            if item.curve_instance_type == 'MESH_CUBE':
-                                icol.prop(item, "thickness"); icol.prop(item, "roundness"); icol.prop(item, "bevel"); icol.prop(item, "pyramid"); icol.prop(item, "twist"); icol.prop(item, "bend")
-                            elif item.curve_instance_type == 'MESH_UVSPHERE':
-                                icol.prop(item, "sphere_thickness"); icol.prop(item, "sphere_elongation"); icol.prop(item, "sphere_cut_angle")
-                            elif item.curve_instance_type == 'MESH_ICOSPHERE':
-                                icol.prop(item, "prism_sides"); icol.prop(item, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(item, "prism_pyramid"); icol.prop(item, "prism_bend"); icol.prop(item, "prism_twist")
-                            elif item.curve_instance_type == 'MESH_TORUS':
-                                icol.prop(item, "torus_outer_radius"); icol.prop(item, "torus_inner_radius"); icol.prop(item, "torus_thickness"); icol.prop(item, "torus_cut_angle"); icol.prop(item, "torus_elongation")
-                            elif item.curve_instance_type == 'MESH_CYLINDER':
-                                icol.prop(item, "cylinder_thickness"); icol.prop(item, "cylinder_roundness"); icol.prop(item, "cylinder_pyramid"); icol.prop(item, "cylinder_bend")
-                            elif item.curve_instance_type == 'MESH_CONE':
-                                icol.label(text="Cone radius is controlled by curve point radius (Alt+S).")
-                        else: # --- CUSTOM MODE UI ---
-                            custom_box = ccol.box()
-                            row = custom_box.row()
-                            row.template_list("SDF_UL_curve_points", "", item, "custom_control_points", item, "active_control_point_index")
-                            ops_col = row.column(align=True)
-                            ops_col.operator("prototyper.sdf_curve_point_add", icon='ADD', text="")
-                            ops_col.operator("prototyper.sdf_curve_point_remove", icon='REMOVE', text="")
-                            idx = item.active_control_point_index
-                            if 0 <= idx < len(item.custom_control_points):
-                                point = item.custom_control_points[idx]
-                                point_box = custom_box.box()
-                                pcol = point_box.column(align=True)
-                                pcol.prop(point, "t_value", text="Position")
-                                pcol.prop(point, "radius_multiplier", text="Radius")
-                                pcol.prop(point, "color")
-                                pcol.prop(point, "shape_type", text="Shape")
-                                pcol.prop(point, "rotation")
-                                inst_box = point_box.box()
-                                inst_box.label(text=f"{point.shape_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
-                                icol = inst_box.column(align=True)
-                                if point.shape_type == 'MESH_CUBE':
-                                    icol.prop(point, "thickness"); icol.prop(point, "roundness"); icol.prop(point, "bevel"); icol.prop(point, "pyramid"); icol.prop(point, "twist"); icol.prop(point, "bend")
-                                elif point.shape_type == 'MESH_UVSPHERE':
-                                    icol.prop(point, "sphere_thickness"); icol.prop(point, "sphere_elongation"); icol.prop(point, "sphere_cut_angle")
-                                elif point.shape_type == 'MESH_ICOSPHERE':
-                                    icol.prop(point, "prism_sides"); icol.prop(point, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(point, "prism_pyramid"); icol.prop(point, "prism_bend"); icol.prop(point, "prism_twist")
-                                elif point.shape_type == 'MESH_TORUS':
-                                    icol.prop(point, "torus_outer_radius"); icol.prop(point, "torus_inner_radius"); icol.prop(point, "torus_thickness"); icol.prop(point, "torus_cut_angle"); icol.prop(point, "torus_elongation")
-                                elif point.shape_type == 'MESH_CYLINDER':
-                                    icol.prop(point, "cylinder_thickness"); icol.prop(point, "cylinder_roundness"); icol.prop(point, "cylinder_pyramid"); icol.prop(point, "cylinder_bend")
-                        radius_box = curve_box.box()
-                        radius_box.label(text="Global Radius & Scale", icon='PROP_CON')
-                        rcol = radius_box.column(align=True)
-                        rcol.prop(item, "curve_global_radius")
-                        rcol.prop(item, "curve_segment_scale") 
-                        rcol.separator()
-                        rcol.prop(item, "curve_taper_head")
-                        rcol.prop(item, "curve_taper_tail")
-                        info_box = curve_box.box()
-                        info_box.label(text="To control per-point radius:", icon='INFO')
-                        info_box.label(text="1. Select the curve object.")
-                        info_box.label(text="2. Go into Edit Mode (Tab).")
-                        info_box.label(text="3. Select a point.")
-                        info_box.label(text="4. Press ALT+S to scale.")
-                    sym = b.box()
-                    sym.label(text="Symmetry", icon='MOD_MIRROR')
-                    mr2 = sym.row(align=True)
-                    mr2.label(text="Mirror:")
-                    mr2.prop(item, "use_mirror_x", text="X", toggle=True)
-                    mr2.prop(item, "use_mirror_y", text="Y", toggle=True)
-                    mr2.prop(item, "use_mirror_z", text="Z", toggle=True)
-                    sym.prop(item, "use_radial_mirror", text="Radial Mirror")
-                    if item.use_radial_mirror:
-                        rb = sym.box()
-                        rb.prop(item, "radial_mirror_count", text="Count")
-        else:
-            shape_box.label(text="No shape selected", icon='INFO')
+            item = domain.sdf_nodes[idx]
             
+            # --- NEW LOGIC: Show different panel for Groups vs Shapes ---
+            if item.is_group:
+                group_settings_box = layout.box()
+                group_settings_box.label(text=f"Group Settings: '{item.name}'", icon='OUTLINER_COLLECTION')
+                col = group_settings_box.column()
+                col.prop(item, "name", text="Rename")
+            
+            else: # It's a regular shape, show the full shape settings
+                shape_box = layout.box()
+                shape_box.label(text="Shape Settings", icon='MODIFIER_DATA')
+                empty = item.empty_object
+                if empty and empty.name in context.view_layer.objects:
+                    geo = get_sdf_geometry_node_tree(context)
+                    node = next((n for n in geo.nodes if n.get("associated_empty") == empty.name), None)
+                    if node:
+                        b = shape_box.box()
+                        b.label(text=f"'{item.name}' Settings", icon='OBJECT_DATA')
+                        sub = b.column(align=True)
+                        sub.prop(item, "name", text="") # The rename field for shapes
+                        if scene.sdf_shader_view:
+                            sb = b.box()
+                            sb.label(text="Shader Operations", icon='SHADING_RENDERED')
+                            sc2 = sb.column(align=True)
+                            sc2.prop(scene, "sdf_global_tint", text="Global Tint")
+                            sc2.prop(item, "operation", text="Operation")
+                            if item.operation in {'UNION', 'SUBTRACT', 'INTERSECT'}:
+                                sc2.prop(item, "blend_type", text="Blend Type")
+                                blend_label = "Chamfer Size" if item.blend_type == 'CHAMFER' else "Smoothness"
+                                sc2.prop(item, "blend", text=blend_label)
+                            elif item.operation in {'DISPLACE', 'INDENT', 'RELIEF', 'ENGRAVE'}:
+                                sc2.prop(item, "blend_strength", text="Strength")
+                                sc2.prop(item, "blend", text="Smoothness")
+                            elif item.operation == 'MASK':
+                                sc2.prop(item, "blend", text="Edge Smoothness")
+                            elif item.operation == 'PAINT':
+                                 sc2.prop(item, "blend_strength", text="Feather")
+                            if item.icon == 'MESH_CUBE':
+                                sc2.prop(item, "thickness"); sc2.prop(item, "roundness"); sc2.prop(item, "bevel"); sc2.prop(item, "pyramid"); sc2.prop(item, "twist"); sc2.prop(item, "bend")
+                            elif item.icon == 'MESH_UVSPHERE':
+                                sc2.prop(item, "sphere_thickness"); sc2.prop(item, "sphere_elongation"); sc2.prop(item, "sphere_cut_angle")
+                            elif item.icon == 'MESH_CYLINDER':
+                                sc2.prop(item, "cylinder_thickness"); sc2.prop(item, "cylinder_roundness"); sc2.prop(item, "cylinder_pyramid"); sc2.prop(item, "cylinder_bend")
+                            elif item.icon == 'MESH_ICOSPHERE':
+                                sc2.prop(item, "prism_sides"); sc2.prop(item, "prism_thickness"); sc2.separator(); sc2.label(text="Deformers:"); sc2.prop(item, "prism_pyramid"); sc2.prop(item, "prism_bend"); sc2.prop(item, "prism_twist")
+                            elif item.icon == 'MESH_TORUS':
+                                sc2.prop(item, "torus_outer_radius"); sc2.prop(item, "torus_inner_radius"); sc2.prop(item, "torus_thickness"); sc2.prop(item, "torus_cut_angle"); sc2.prop(item, "torus_elongation")
+                            sc2.prop(item, "preview_color", text="Color")
+                            sc2.prop(scene, "sdf_color_blend_mode", text="Color Blend")
+                        else:
+                            gn = b.box()
+                            gn.label(text="Modeling Mode Inputs", icon='NODETREE')
+                            tabs = gn.row(align=True)
+                            tabs.prop(scene, "sdf_shape_tab", expand=True)
+                            col3 = gn.column(align=True)
+                            if scene.sdf_shape_tab == 'DEFORM':
+                                row3 = col3.row(align=True)
+                                row3.label(text="Flip Shape:")
+                                op_x = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="X"); op_x.axis = 'X'
+                                op_y = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Y"); op_y.axis = 'Y'
+                                op_z = row3.operator(PROTOTYPER_OT_SDFFlipActiveShape.bl_idname, text="Z"); op_z.axis = 'Z'
+                                col3.separator()
+                            for sock in node.inputs:
+                                key = sock.name.lower()
+                                tab = scene.sdf_shape_tab
+                                show = ((tab=='BASIC' and any(k in key for k in ("radius","width","height","depth","size"))) or (tab=='DEFORM' and any(k in key for k in ("bend","twist","taper","scale"))) or (tab=='STYLE' and any(k in key for k in ("blend","style","soft","round"))) or (tab=='MISC' and not any(k in key for k in ("sdf","slice","object"))))
+                                if show:
+                                    col3.prop(sock, "default_value", text=sock.name)
+                        if item.icon == 'CURVE_BEZCURVE':
+                            curve_box = b.box()
+                            curve_box.label(text="Curve Settings", icon='CURVE_DATA')
+                            ccol = curve_box.column(align=True)
+                            ccol.prop(item, "curve_mode", expand=True)
+                            ccol.prop(item, "curve_control_mode", expand=True)
+                            if item.curve_control_mode == 'UNIFORM':
+                                uniform_box = ccol.box()
+                                ucol = uniform_box.column(align=True)
+                                ucol.prop(item, "curve_instance_type", text="Shape")
+                                ucol.prop(item, "curve_point_density")
+                                ucol.prop(item, "curve_instance_spacing", text="Spacing")
+                                ucol.prop(item, "curve_instance_rotation", text="Rotation")
+                                inst_box = uniform_box.box()
+                                inst_box.label(text=f"{item.curve_instance_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
+                                icol = inst_box.column(align=True)
+                                if item.curve_instance_type == 'MESH_CUBE':
+                                    icol.prop(item, "thickness"); icol.prop(item, "roundness"); icol.prop(item, "bevel"); icol.prop(item, "pyramid"); icol.prop(item, "twist"); icol.prop(item, "bend")
+                                elif item.curve_instance_type == 'MESH_UVSPHERE':
+                                    icol.prop(item, "sphere_thickness"); icol.prop(item, "sphere_elongation"); icol.prop(item, "sphere_cut_angle")
+                                elif item.curve_instance_type == 'MESH_ICOSPHERE':
+                                    icol.prop(item, "prism_sides"); icol.prop(item, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(item, "prism_pyramid"); icol.prop(item, "prism_bend"); icol.prop(item, "prism_twist")
+                                elif item.curve_instance_type == 'MESH_TORUS':
+                                    icol.prop(item, "torus_outer_radius"); icol.prop(item, "torus_inner_radius"); icol.prop(item, "torus_thickness"); icol.prop(item, "torus_cut_angle"); icol.prop(item, "torus_elongation")
+                                elif item.curve_instance_type == 'MESH_CYLINDER':
+                                    icol.prop(item, "cylinder_thickness"); icol.prop(item, "cylinder_roundness"); icol.prop(item, "cylinder_pyramid"); icol.prop(item, "cylinder_bend")
+                                elif item.curve_instance_type == 'MESH_CONE':
+                                    icol.label(text="Cone radius is controlled by curve point radius (Alt+S).")
+                            else: # --- CUSTOM MODE UI ---
+                                custom_box = ccol.box()
+                                row = custom_box.row()
+                                row.template_list("SDF_UL_curve_points", "", item, "custom_control_points", item, "active_control_point_index")
+                                ops_col = row.column(align=True)
+                                ops_col.operator("prototyper.sdf_curve_point_add", icon='ADD', text="")
+                                ops_col.operator("prototyper.sdf_curve_point_remove", icon='REMOVE', text="")
+                                c_idx = item.active_control_point_index
+                                if 0 <= c_idx < len(item.custom_control_points):
+                                    point = item.custom_control_points[c_idx]
+                                    point_box = custom_box.box()
+                                    pcol = point_box.column(align=True)
+                                    pcol.prop(point, "t_value", text="Position")
+                                    pcol.prop(point, "radius_multiplier", text="Radius")
+                                    pcol.prop(point, "color")
+                                    pcol.prop(point, "shape_type", text="Shape")
+                                    pcol.prop(point, "rotation")
+                                    inst_box = point_box.box()
+                                    inst_box.label(text=f"{point.shape_type.replace('_', ' ').title()} Settings", icon='MODIFIER_DATA')
+                                    icol = inst_box.column(align=True)
+                                    if point.shape_type == 'MESH_CUBE':
+                                        icol.prop(point, "thickness"); icol.prop(point, "roundness"); icol.prop(point, "bevel"); icol.prop(point, "pyramid"); icol.prop(point, "twist"); icol.prop(point, "bend")
+                                    elif point.shape_type == 'MESH_UVSPHERE':
+                                        icol.prop(point, "sphere_thickness"); icol.prop(point, "sphere_elongation"); icol.prop(point, "sphere_cut_angle")
+                                    elif point.shape_type == 'MESH_ICOSPHERE':
+                                        icol.prop(point, "prism_sides"); icol.prop(point, "prism_thickness"); icol.separator(); icol.label(text="Deformers:"); icol.prop(point, "prism_pyramid"); icol.prop(point, "prism_bend"); icol.prop(point, "prism_twist")
+                                    elif point.shape_type == 'MESH_TORUS':
+                                        icol.prop(point, "torus_outer_radius"); icol.prop(point, "torus_inner_radius"); icol.prop(point, "torus_thickness"); icol.prop(point, "torus_cut_angle"); icol.prop(point, "torus_elongation")
+                                    elif point.shape_type == 'MESH_CYLINDER':
+                                        icol.prop(point, "cylinder_thickness"); icol.prop(point, "cylinder_roundness"); icol.prop(point, "cylinder_pyramid"); icol.prop(point, "cylinder_bend")
+                            radius_box = curve_box.box()
+                            radius_box.label(text="Global Radius & Scale", icon='PROP_CON')
+                            rcol = radius_box.column(align=True)
+                            rcol.prop(item, "curve_global_radius")
+                            rcol.prop(item, "curve_segment_scale") 
+                            rcol.separator()
+                            rcol.prop(item, "curve_taper_head")
+                            rcol.prop(item, "curve_taper_tail")
+                            info_box = curve_box.box()
+                            info_box.label(text="To control per-point radius:", icon='INFO')
+                            info_box.label(text="1. Select the curve object.")
+                            info_box.label(text="2. Go into Edit Mode (Tab).")
+                            info_box.label(text="3. Select a point.")
+                            info_box.label(text="4. Press ALT+S to scale.")
+                        sym = b.box()
+                        sym.label(text="Symmetry", icon='MOD_MIRROR')
+                        mr2 = sym.row(align=True)
+                        mr2.label(text="Mirror:")
+                        mr2.prop(item, "use_mirror_x", text="X", toggle=True)
+                        mr2.prop(item, "use_mirror_y", text="Y", toggle=True)
+                        mr2.prop(item, "use_mirror_z", text="Z", toggle=True)
+                        sym.prop(item, "use_radial_mirror", text="Radial Mirror")
+                        if item.use_radial_mirror:
+                            rb = sym.box()
+                            rb.prop(item, "radial_mirror_count", text="Count")
+        else:
+            layout.label(text="No item selected", icon='INFO')
+            
+        # --- Finalize & Symmetrize Section ---
         layout.separator()
         act_box = layout.box()
         act_box.label(text="Finalize & Symmetrize", icon='MOD_MESHDEFORM')
         act_col = act_box.column(align=True)
         act_col.operator("object.convert_sdf", text="Convert to Mesh", icon='MESH_DATA')
         act_col.operator("object.sdf_bake_volume", text="Bake to High-Quality Mesh", icon='VOLUME_DATA')
-        
         act_col.operator("object.sdf_bake_to_remesh", text="Bake for Remesh Object", icon='TEXTURE')
-
         act_col.separator()
         act_col.operator(OBJECT_OT_sdf_auto_uv.bl_idname, text="Auto UV Selected", icon='UV_DATA')
-        # --- NEW BUTTON ADDED HERE ---
         act_col.operator(OBJECT_OT_sdf_remesh_tools.bl_idname, text="Open Remesh Tools", icon='MOD_REMESH')
         act_col.operator(OBJECT_OT_sdf_snap_selection_to_active.bl_idname, text="Snap Selection to Active", icon='SNAP_ON')
-
         act_col.separator()
         act_col.operator("prototyper.sdf_bake_symmetry", text="Bake Active Symmetries", icon='CHECKMARK')
         act_col.operator("prototyper.sdf_symmetrize", text="Symmetrize Model", icon='MOD_MIRROR')
         act_col.operator("prototyper.sdf_flip_model", text="Flip Model...", icon='CON_ACTION')
+
+        # --- Brush-Cube Clipping Section ---
         layout.separator()
         brush_box = layout.box()
         brush_box.label(text="Brush-Cube Clipping", icon='CUBE')
@@ -4764,41 +4837,6 @@ class SDFSculptAdd(bpy.types.Operator):
 # -------------------------------------------------------------------
 # List Management Operators (move up, move down, duplicate, delete, clear, etc.)
 # -------------------------------------------------------------------
-import bpy
-
-# 1) Update the list-move operator to include a default for direction
-class PROTOTYPER_OT_SDFListMove(bpy.types.Operator):
-    """Move an item in the SDF list and rewire the node chain."""
-    bl_idname = "prototyper.sdf_list_move"
-    bl_label = "Move SDF List Item"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    direction: bpy.props.EnumProperty(
-        name="Direction",
-        items=[
-            ('UP',   "Up",   "Move item up"),
-            ('DOWN', "Down", "Move item down"),
-        ],
-        default='UP'
-    )
-
-
-    @classmethod
-    def poll(cls, context):
-        dom = getattr(context.scene, "sdf_domain", None)
-        return dom and dom.active_sdf_node_index >= 0
-
-    def execute(self, context):
-        dom = context.scene.sdf_domain
-        idx = dom.active_sdf_node_index
-        new_idx = idx - 1 if self.direction == 'UP' else idx + 1
-
-        if 0 <= new_idx < len(dom.sdf_nodes):
-            dom.sdf_nodes.move(idx, new_idx)
-            dom.active_sdf_node_index = new_idx
-            rewire_full_sdf_chain(context)
-        return {'FINISHED'}
-
 
 #--------------------------------------------------------------------
 
@@ -5117,6 +5155,13 @@ class SDFNodeItem(PropertyGroup):
     # --- UI & MUTE PROPERTIES ---
     is_hidden: BoolProperty(name="Mute Shape", default=False, update=update_visibility_and_mute)
     is_viewport_hidden: BoolProperty(name="Hide Empty", default=False, update=update_visibility_and_mute)
+
+    # --- NEW: Group Properties ---
+    is_group: BoolProperty(name="Is Group", default=False, description="If true, this item is a group folder")
+    expanded: BoolProperty(name="Expanded", default=True, description="Show/hide children in UI", update=_redraw_shader_view)  # Redraw on toggle
+    level: IntProperty(name="Indent Level", default=0, min=0, description="For UI indentation")
+    parent_index: IntProperty(name="Parent Group Index", default=-1, description="Index of parent group; -1 for top-level")
+    group_color: FloatVectorProperty(name="Group Color", subtype='COLOR', default=(0.8, 0.8, 0.8), min=0.0, max=1.0, description="Tint for group in UI")
     
     # --- COMMON SHADER PROPERTIES ---
     use_highlight: BoolProperty(name="Highlight Shape", default=False, update=_redraw_shader_view)
@@ -5299,6 +5344,445 @@ class SDFNodeItem(PropertyGroup):
     curve_taper_head: FloatProperty(name="Taper Head", default=1.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
     curve_taper_tail: FloatProperty(name="Taper Tail", default=1.0, min=0.0, max=1.0, subtype='FACTOR', update=_redraw_shader_view)
 
+
+#---------------------------------------------------------------------------
+# This function dynamically finds all groups for the operator's dropdown menu
+def get_group_items(self, context):
+    items = []
+    domain = context.scene.sdf_domain
+    if domain and hasattr(domain, 'sdf_nodes'):
+        for i, item in enumerate(domain.sdf_nodes):
+            if item.is_group:
+                items.append((str(i), item.name, f"Assign selected shapes to the '{item.name}' group"))
+    if not items:
+        items.append(("-1", "No Groups Available", "Create a group first using the 'Add Group' button"))
+    return items
+
+class PROTOTYPER_OT_SDFAddGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_add_group"
+    bl_label = "Add Group"
+    bl_description = "Create a new group in the SDF list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        if domain:
+            group = domain.sdf_nodes.add()
+            group.name = "New Group"
+            group.is_group = True
+            domain.active_sdf_node_index = len(domain.sdf_nodes) - 1
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFAssignToGroup(bpy.types.Operator):
+    """Assigns the selected SDF shapes to a chosen group via a popup list"""
+    bl_idname = "prototyper.sdf_assign_to_group"
+    bl_label = "Assign Shapes to Group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target_group_index: bpy.props.EnumProperty(
+        name="Target Group",
+        description="Choose the group to add shapes to",
+        items=get_group_items
+    )
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        return domain and len(domain.sdf_nodes) > 0
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        group_index = int(self.target_group_index)
+
+        if not domain or group_index < 0:
+            self.report({'WARNING'}, "No valid group was selected.")
+            return {'CANCELLED'}
+            
+        group = domain.sdf_nodes[group_index]
+        if not group.is_group:
+            self.report({'ERROR'}, "The selected target is not a group.")
+            return {'CANCELLED'}
+
+        selected_indices = []
+        selected_empties = {obj.name for obj in context.selected_objects if obj.type == 'EMPTY'}
+        if selected_empties:
+            for i, item in enumerate(domain.sdf_nodes):
+                if not item.is_group and item.empty_object and item.empty_object.name in selected_empties:
+                    selected_indices.append(i)
+        else:
+            selected_indices = [i for i, item in enumerate(domain.sdf_nodes) if item.use_highlight and not item.is_group]
+
+        if not selected_indices:
+            self.report({'WARNING'}, "No shapes selected to assign. Select empties in the 3D view or highlight items in the list.")
+            return {'CANCELLED'}
+
+        for idx in sorted(selected_indices, reverse=True):
+            item = domain.sdf_nodes[idx]
+            if item.parent_index != -1: continue
+
+            item.parent_index = group_index
+            item.level = group.level + 1
+            
+            insert_pos = group_index + 1
+            while insert_pos < len(domain.sdf_nodes) and domain.sdf_nodes[insert_pos].parent_index == group_index:
+                insert_pos += 1
+            
+            domain.sdf_nodes.move(idx, insert_pos)
+
+        _remap_parent_indices(domain.sdf_nodes)
+        group.expanded = True
+        rewire_full_sdf_chain(context)
+        self.report({'INFO'}, f"Assigned {len(selected_indices)} shapes to '{group.name}'.")
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFUngroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_ungroup"
+    bl_label = "Remove from Group"
+    bl_description = "Remove selected shapes from their group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        if not domain: return {'CANCELLED'}
+        
+        items_to_ungroup = []
+        selected_empties = {obj.name for obj in context.selected_objects if obj.type == 'EMPTY'}
+        if selected_empties:
+            for item in domain.sdf_nodes:
+                if not item.is_group and item.empty_object and item.empty_object.name in selected_empties and item.parent_index != -1:
+                    items_to_ungroup.append(item)
+        else:
+            items_to_ungroup = [item for item in domain.sdf_nodes if item.use_highlight and not item.is_group and item.parent_index != -1]
+
+        if not items_to_ungroup:
+            self.report({'WARNING'}, "No selected/highlighted shapes found within a group.")
+            return {'CANCELLED'}
+
+        for item in items_to_ungroup:
+            item.parent_index = -1
+            item.level = 0
+        
+        _remap_parent_indices(domain.sdf_nodes)
+        rewire_full_sdf_chain(context)
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFDeleteGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_delete_group"
+    bl_label = "Delete Group"
+    bl_description = "Delete the active group and either delete or release its children"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    delete_children: bpy.props.BoolProperty(name="Delete Children", default=False)
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        
+        children_indices = [i for i, item in enumerate(domain.sdf_nodes) if item.parent_index == active_idx]
+
+        if self.delete_children:
+            indices_to_delete = sorted(children_indices + [active_idx], reverse=True)
+            for idx in indices_to_delete:
+                _delete_sdf_item_at(context, idx)
+        else:
+            for idx in children_indices:
+                domain.sdf_nodes[idx].parent_index = -1
+                domain.sdf_nodes[idx].level = 0
+            _delete_sdf_item_at(context, active_idx)
+
+        _remap_parent_indices(domain.sdf_nodes)
+        domain.active_sdf_node_index = min(active_idx, len(domain.sdf_nodes) - 1)
+        rewire_full_sdf_chain(context)
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFClearGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_clear_group"
+    bl_label = "Clear Group"
+    bl_description = "Ungroup all children from the active group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        
+        children = [item for item in domain.sdf_nodes if item.parent_index == active_idx]
+        for child in children:
+            child.parent_index = -1
+            child.level = 0
+            
+        _remap_parent_indices(domain.sdf_nodes)
+        rewire_full_sdf_chain(context)
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFHighlightGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_highlight_group"
+    bl_label = "Toggle Group Highlight"
+    bl_description = "Toggle highlight for all shapes in the active group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        
+        children = [item for item in domain.sdf_nodes if item.parent_index == active_idx]
+        if not children: return {'CANCELLED'}
+        
+        new_highlight_state = not all(child.use_highlight for child in children)
+        
+        for child in children:
+            child.use_highlight = new_highlight_state
+            
+        _redraw_shader_view(None, context)
+        domain.active_sdf_node_index = active_idx
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFSelectGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_select_group"
+    bl_label = "Select Group Children"
+    bl_description = "Select all controller empties in the active group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        children = [item for item in domain.sdf_nodes if item.parent_index == active_idx]
+        
+        last_child_empty = None
+        for child in children:
+            if child.empty_object:
+                child.empty_object.select_set(True)
+                last_child_empty = child.empty_object
+        
+        if last_child_empty:
+            context.view_layer.objects.active = last_child_empty
+
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFHideGroup(bpy.types.Operator):
+    bl_idname = "prototyper.sdf_hide_group"
+    bl_label = "Toggle Group Visibility"
+    bl_description = "Toggle hide/mute for the active group itself"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        group_item = domain.sdf_nodes[active_idx]
+        
+        group_item.is_hidden = not group_item.is_hidden
+        
+        update_visibility_and_mute(group_item, context)
+        domain.active_sdf_node_index = active_idx
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFSelectGroupItem(bpy.types.Operator):
+    """Sets the active index in the UI list, used to select groups."""
+    bl_idname = "prototyper.sdf_select_group_item"
+    bl_label = "Select SDF List Item"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        if domain:
+            domain.active_sdf_node_index = self.index
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFLockGroup(bpy.types.Operator):
+    """Toggles the mute/hide state for all shapes within the active group."""
+    bl_idname = "prototyper.sdf_lock_group"
+    bl_label = "Toggle Group Lock"
+    bl_description = "Toggle mute and viewport visibility for all shapes in the group"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        domain = context.scene.sdf_domain
+        if not domain or domain.active_sdf_node_index < 0: return False
+        return domain.sdf_nodes[domain.active_sdf_node_index].is_group
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        active_idx = domain.active_sdf_node_index
+        
+        children = [item for item in domain.sdf_nodes if item.parent_index == active_idx]
+        if not children:
+            return {'CANCELLED'}
+
+        new_lock_state = not all(child.is_hidden for child in children)
+        
+        for child in children:
+            child.is_hidden = new_lock_state
+            child.is_viewport_hidden = new_lock_state
+        
+        domain.active_sdf_node_index = active_idx
+        return {'FINISHED'}
+
+class PROTOTYPER_OT_SDFListMove(bpy.types.Operator):
+    """Move an item or a group block in the SDF list and rewire the node chain."""
+    bl_idname = "prototyper.sdf_list_move"
+    bl_label = "Move SDF List Item"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: bpy.props.EnumProperty(
+        name="Direction",
+        items=[('UP', "Up", "Move item up"), ('DOWN', "Down", "Move item down")],
+        default='UP'
+    )
+
+    @classmethod
+    def poll(cls, context):
+        dom = getattr(context.scene, "sdf_domain", None)
+        return dom and dom.active_sdf_node_index >= 0
+
+    def execute(self, context):
+        domain = context.scene.sdf_domain
+        idx = domain.active_sdf_node_index
+        item = domain.sdf_nodes[idx]
+        
+        start_idx = idx
+        if item.parent_index != -1:
+            start_idx = item.parent_index
+        
+        end_idx = start_idx + 1
+        while end_idx < len(domain.sdf_nodes) and domain.sdf_nodes[end_idx].parent_index == start_idx:
+            end_idx += 1
+        
+        block_size = end_idx - start_idx
+        
+        if self.direction == 'UP':
+            if start_idx == 0: return {'CANCELLED'}
+            
+            target_idx = start_idx - 1
+            if domain.sdf_nodes[target_idx].parent_index != -1:
+                target_idx = domain.sdf_nodes[target_idx].parent_index
+            
+            for i in range(block_size):
+                domain.sdf_nodes.move(start_idx, target_idx)
+            
+            domain.active_sdf_node_index = target_idx
+
+        else: # DOWN
+            if end_idx >= len(domain.sdf_nodes): return {'CANCELLED'}
+            
+            target_idx = end_idx
+            if target_idx < len(domain.sdf_nodes):
+                next_item = domain.sdf_nodes[target_idx]
+                if next_item.parent_index != -1:
+                    parent_of_next = next_item.parent_index
+                    target_idx = parent_of_next + 1
+                    while target_idx < len(domain.sdf_nodes) and domain.sdf_nodes[target_idx].parent_index == parent_of_next:
+                        target_idx += 1
+                elif next_item.is_group:
+                    target_idx += 1
+                    while target_idx < len(domain.sdf_nodes) and domain.sdf_nodes[target_idx].parent_index == end_idx:
+                        target_idx += 1
+
+            move_to_idx = target_idx
+            
+            for i in range(block_size):
+                domain.sdf_nodes.move(start_idx, move_to_idx - 1)
+
+            domain.active_sdf_node_index = move_to_idx - block_size
+
+        _remap_parent_indices(domain.sdf_nodes)
+        rewire_full_sdf_chain(context)
+        return {'FINISHED'}
+    
+
+def _remap_parent_indices(sdf_nodes):
+    """
+    Iterates through the entire list and corrects all parent_index values.
+    This is a critical data integrity function to run after any move or delete operation.
+    """
+    # Create a map of the original item's name to its new index.
+    # Using name is safer than object reference if the list is being rebuilt.
+    item_map = {item.name: i for i, item in enumerate(sdf_nodes)}
+    
+    for i, item in enumerate(sdf_nodes):
+        if item.parent_index != -1:
+            try:
+                # Find the name of the parent it's SUPPOSED to have
+                parent_name = sdf_nodes[item.parent_index].name
+                if parent_name in item_map:
+                    # Update the index to the parent's new position
+                    item.parent_index = item_map[parent_name]
+                else: # Parent no longer exists
+                    item.parent_index = -1
+                    item.level = 0
+            except IndexError:
+                # The parent_index was already invalid, so reset it
+                item.parent_index = -1
+                item.level = 0
+
+def _delete_sdf_item_at(context, index):
+    """
+    Safely deletes a single SDF item at a given index, including its object,
+    node, and children. Does NOT remap indices afterwards.
+    """
+    domain_obj = context.scene.sdf_domain
+    if not (0 <= index < len(domain_obj.sdf_nodes)):
+        return
+
+    del_item = domain_obj.sdf_nodes[index]
+    
+    # If it's a group, we don't need to delete objects, just the list item
+    if not del_item.is_group:
+        del_empty = del_item.empty_object
+        node_tree = get_sdf_geometry_node_tree(context)
+
+        if del_empty:
+            if node_tree:
+                del_node = next((n for n in node_tree.nodes if n.get("associated_empty") == del_empty.name), None)
+                if del_node:
+                    node_tree.nodes.remove(del_node)
+            
+            for child in list(del_empty.children):
+                bpy.data.objects.remove(child, do_unlink=True)
+            bpy.data.objects.remove(del_empty, do_unlink=True)
+    
+    domain_obj.sdf_nodes.remove(index)
+
+
 # -------------------------------------------------------------------
 # 2) List of classes to register (excluding PropertyGroup)
 # -------------------------------------------------------------------
@@ -5355,9 +5839,9 @@ class SDFLibraryGuideOperator(bpy.types.Operator):
         box.label(text="   - C:\\Users\\<your username>\\AppData\\Roaming\\Python\\Python310\\site-packages (if it exists)")
         box.label(text="   In each folder, search for folders/files related to: scipy, scikit-image (or skimage), PyMCubes (or pymcubes), pyopenvdb (or openvdb).")
         box.label(text="   Right-click and delete only those specific items. Do NOT delete the entire site-packages folder unless you're sure no other apps use it.")
-        box.label(text="3. Delete the Blender user data folder: C:\\Users\\<your username>\\AppData\\Roaming\\Blender Foundation\\Blender")
+        box.label(text="3. If you like for a clean start, Delete the Blender user data folder: C:\\Users\\<your username>\\AppData\\Roaming\\Blender Foundation\\Blender")
         box.label(text="4. Delete the Blender install folder if remnants remain: C:\\Program Files\\Blender Foundation\\Blender 4.5")
-        box.label(text="5. Re-download and reinstall Blender 4.5 LTS from blender.org (use the .msi installer).")
+        box.label(text="5. Re-download and reinstall Blender 4.5 LTS or 5.0 and above from blender.org (use the .msi installer).")
         box.label(text="6. Reinstall the Rogue SDF AI add-on ZIP via Preferences > Add-ons > Install.")
         box.label(text="7. To install missing libraries, open Command Prompt as Administrator (search 'cmd' in Start menu, right-click > Run as administrator).")
         box.label(text="   Run these commands one by one (adjust Blender path if different):")
@@ -5372,6 +5856,61 @@ class SDFLibraryGuideOperator(bpy.types.Operator):
         box.label(text="9. Restart Blender and test baking/exporting.")
         box.label(text="If builds fail in CMD (e.g., compiler error), install free Visual Studio Build Tools from Microsoft (search 'Visual C++ Build Tools').")
 
+
+class SDFCopyCommandsOperator(bpy.types.Operator):
+    """Copy library fix commands and steps to clipboard"""
+    bl_idname = "prototyper.sdf_copy_commands"
+    bl_label = "Copy Commands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Compile the multi-line text with steps
+        text = """
+If baking/exporting fails (e.g., missing modules), follow these steps carefully. Copy this into a text file (e.g., Notepad) for reference.
+
+WARNING: Be careful with deletions! Only remove the specific libraries listed below to avoid breaking other Python apps or Blender setups. Always back up important files first. If unsure, skip deletions and just reinstall packages.
+
+1. Close Blender completely (check Task Manager to end any processes).
+
+2. Uninstall Blender: Go to Windows Settings > Apps > Installed Apps > Search 'Blender' > Uninstall.
+
+3. Targeted Cleanup (do NOT delete entire folders unless necessary):
+   - Open File Explorer.
+   - Navigate to: C:\\Users\\<your username>\\AppData\\Roaming\\Python\\Python311\\site-packages (replace <your username> with your actual Windows username, e.g., 'Lion').
+     - Search for folders/files: scipy, scikit-image (or skimage), PyMCubes (or pymcubes), pyopenvdb (or openvdb).
+     - Right-click and delete ONLY those specific items. Skip if not found.
+   - Repeat for: C:\\Users\\<your username>\\AppData\\Roaming\\Python\\Python310\\site-packages (if it exists).
+   - For Blender user data (careful—this resets all custom settings/add-ons): Delete C:\\Users\\<your username>\\AppData\\Roaming\\Blender Foundation\\Blender
+   - If Blender install remnants remain, delete: C:\\Program Files\\Blender Foundation\\Blender 4.5
+
+4. Re-download Blender 4.5 LTS from blender.org (use the .msi installer) and reinstall.
+
+5. Reinstall Rogue SDF AI: In Blender, Edit > Preferences > Add-ons > Install > select your ZIP.
+
+6. Install Libraries via Command Prompt (as Administrator):
+   - Search 'cmd' in Start menu, right-click > Run as administrator.
+   - Run these commands one by one (adjust path if your Blender version/install location differs):
+     cd "C:\\Program Files\\Blender Foundation\\Blender 4.5\\4.5\\python\\bin"
+     python.exe -m ensurepip --upgrade
+     python.exe -m pip install --upgrade pip
+     python.exe -m pip install --target="C:\\Program Files\\Blender Foundation\\Blender 4.5\\4.5\\python\\lib\\site-packages" scipy
+     python.exe -m pip install --target="C:\\Program Files\\Blender Foundation\\Blender 4.5\\4.5\\python\\lib\\site-packages" scikit-image
+     python.exe -m pip install --target="C:\\Program Files\\Blender Foundation\\Blender 4.5\\4.5\\python\\lib\\site-packages" PyMCubes
+     # For pyopenvdb (optional, for VDB smoothing): Hard on Windows; no easy pip. Skip or build from source (advanced).
+
+7. Create Blender Shortcut for Access: Right-click blender.exe > Create shortcut > Properties > Add to Target: --python-use-system-env (e.g., "C:\\Program Files\\Blender Foundation\\Blender 4.5\\blender.exe" --python-use-system-env)
+
+8. Launch Blender with the shortcut, test baking/exporting.
+
+If CMD installs fail (e.g., compiler error), install free Visual Studio Build Tools from Microsoft (search 'Visual C++ Build Tools').
+"""
+
+        # Copy to clipboard
+        context.window_manager.clipboard = text
+        self.report({'INFO'}, "Commands and steps copied to clipboard! Paste into a text file.")
+        return {'FINISHED'}
+
+
 # -------------------------------------------------------------------
 # 2) List of classes to register (excluding PropertyGroup)
 # -------------------------------------------------------------------
@@ -5383,8 +5922,22 @@ _classes = [
     SDF_UL_curve_points,
     VIEW3D_MT_sdf_rclick,
 
+    # Library Helper Operators
     SDFLibraryGuideOperator,
     SDFLibraryTooltipOperator,
+    SDFCopyCommandsOperator,
+
+    # Group Management Operators
+    PROTOTYPER_OT_SDFAddGroup,
+    PROTOTYPER_OT_SDFAssignToGroup,
+    PROTOTYPER_OT_SDFUngroup,
+    PROTOTYPER_OT_SDFDeleteGroup,
+    PROTOTYPER_OT_SDFClearGroup,
+    PROTOTYPER_OT_SDFLockGroup, # <-- Now included
+    PROTOTYPER_OT_SDFHighlightGroup,
+    PROTOTYPER_OT_SDFSelectGroup,
+    PROTOTYPER_OT_SDFHideGroup,
+    PROTOTYPER_OT_SDFSelectGroupItem, # <-- Now included
 
     # Data Structures (must be registered before classes that use them)
     SDFCurveControlPoint,
@@ -5394,29 +5947,37 @@ _classes = [
     ConvertSDFOperator,
     OBJECT_OT_sdf_bake_volume,
     OBJECT_OT_sdf_bake_to_remesh,
-    OBJECT_OT_sdf_auto_uv,                    
-    OBJECT_OT_sdf_snap_selection_to_active, 
-    # --- THIS IS THE ONLY CHANGE: Using the new, correct operator ---
+    OBJECT_OT_sdf_auto_uv,
+    OBJECT_OT_sdf_snap_selection_to_active,
     OBJECT_OT_sdf_remesh_tools,
 
-    # Add SDF Shape Operators (YOUR FULL LIST IS PRESERVED)
-    SDFCubeAdd, SDFCylinderAdd, SDFUVSphereAdd, SDFConeAdd,
-    SDFPrismAdd, SDFTorusAdd, SDFCurveAdd, SDFMeshAdd, SDFSculptAdd,
+    # Add SDF Shape Operators
+    SDFCubeAdd,
+    SDFCylinderAdd,
+    SDFUVSphereAdd,
+    SDFConeAdd,
+    SDFPrismAdd,
+    SDFTorusAdd,
+    SDFCurveAdd,
+    SDFMeshAdd,
+    SDFSculptAdd,
     SDFMeshToSDF,
 
     # List & Shape Management Operators
     PROTOTYPER_OT_SDFSetPointCloudPreview,
     PROTOTYPER_OT_SDFListMove,
-    SDFDuplicateOperator, SDFDeleteOperator, SDFClearOperator,
+    SDFDuplicateOperator,
+    SDFDeleteOperator,
+    SDFClearOperator,
     PROTOTYPER_OT_SDFRepeatShape,
     PROTOTYPER_OT_SDFCleanupList,
     PROTOTYPER_OT_toggle_smooth,
-    PROTOTYPER_OT_SDFCurvePointAdd, 
+    PROTOTYPER_OT_SDFCurvePointAdd,
     PROTOTYPER_OT_SDFCurvePointRemove,
 
-    # Symmetry Baking Operator
+    # Symmetry Operators
     OBJECT_OT_bake_sdf_symmetry,
-    PROTOTYPER_OT_SDFSymmetrize, 
+    PROTOTYPER_OT_SDFSymmetrize,
     PROTOTYPER_OT_SDFFlipActiveShape,
     PROTOTYPER_OT_SDFFlipModel,
 
@@ -5426,9 +5987,12 @@ _classes = [
     OBJECT_OT_ToggleDecimation,
 
     # Brush-Cube Clipping Operators
-    OBJECT_OT_create_brush_cube, OBJECT_OT_delete_brush_cube,
-    OBJECT_OT_reset_brush_cube_transform, OBJECT_OT_select_brush_cube,
-    OBJECT_OT_toggle_brush_cube_visibility, OBJECT_OT_apply_brush_cube,
+    OBJECT_OT_create_brush_cube,
+    OBJECT_OT_delete_brush_cube,
+    OBJECT_OT_reset_brush_cube_transform,
+    OBJECT_OT_select_brush_cube,
+    OBJECT_OT_toggle_brush_cube_visibility,
+    OBJECT_OT_apply_brush_cube,
     OBJECT_OT_toggle_clip,
 
     # Rendering Operators
