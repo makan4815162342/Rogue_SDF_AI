@@ -5679,51 +5679,58 @@ class PROTOTYPER_OT_SDFListMove(bpy.types.Operator):
         idx = domain.active_sdf_node_index
         item = domain.sdf_nodes[idx]
         
+        # --- NEW: Identify the entire block to be moved (item or group) ---
         start_idx = idx
+        # If the selected item is in a group, find the start of the group
         if item.parent_index != -1:
             start_idx = item.parent_index
         
+        # Find the end of the block
         end_idx = start_idx + 1
-        while end_idx < len(domain.sdf_nodes) and domain.sdf_nodes[end_idx].parent_index == start_idx:
-            end_idx += 1
+        if domain.sdf_nodes[start_idx].is_group:
+            while end_idx < len(domain.sdf_nodes) and domain.sdf_nodes[end_idx].parent_index == start_idx:
+                end_idx += 1
         
         block_size = end_idx - start_idx
         
         if self.direction == 'UP':
             if start_idx == 0: return {'CANCELLED'}
             
+            # Find the start of the previous block
             target_idx = start_idx - 1
             if domain.sdf_nodes[target_idx].parent_index != -1:
                 target_idx = domain.sdf_nodes[target_idx].parent_index
             
+            # Move the entire block
             for i in range(block_size):
                 domain.sdf_nodes.move(start_idx, target_idx)
             
+            # Update the active index
             domain.active_sdf_node_index = target_idx
 
         else: # DOWN
             if end_idx >= len(domain.sdf_nodes): return {'CANCELLED'}
             
+            # --- THIS IS THE CORRECTED LOGIC ---
+            # Find the start of the next block
             target_idx = end_idx
-            if target_idx < len(domain.sdf_nodes):
-                next_item = domain.sdf_nodes[target_idx]
-                if next_item.parent_index != -1:
-                    parent_of_next = next_item.parent_index
-                    target_idx = parent_of_next + 1
-                    while target_idx < len(domain.sdf_nodes) and domain.sdf_nodes[target_idx].parent_index == parent_of_next:
-                        target_idx += 1
-                elif next_item.is_group:
-                    target_idx += 1
-                    while target_idx < len(domain.sdf_nodes) and domain.sdf_nodes[target_idx].parent_index == end_idx:
-                        target_idx += 1
-
-            move_to_idx = target_idx
+            next_item = domain.sdf_nodes[target_idx]
             
+            # Find the end of that next block
+            move_to_idx = target_idx + 1
+            if next_item.is_group:
+                 while move_to_idx < len(domain.sdf_nodes) and domain.sdf_nodes[move_to_idx].parent_index == target_idx:
+                    move_to_idx += 1
+            
+            # Move our current block to the position right after the next block
             for i in range(block_size):
+                # We move the first element of our block repeatedly, which shifts the whole block down
                 domain.sdf_nodes.move(start_idx, move_to_idx - 1)
 
+            # Update the active index to the new position of the item that was moved
             domain.active_sdf_node_index = move_to_idx - block_size
 
+        # After any move, it's critical to remap parent indices to maintain data integrity
         _remap_parent_indices(domain.sdf_nodes)
         rewire_full_sdf_chain(context)
         return {'FINISHED'}
